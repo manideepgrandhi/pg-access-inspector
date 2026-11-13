@@ -35,6 +35,7 @@ The fixture has, among others:
 - \`hr_reader\` with column grants on \`hr.employees\`
 - \`sales.orders\` with row level security and one policy for \`sales_emea\`
 - default privileges for \`app_owner\` in \`sales\`, but tables there are also created by \`etl_owner\`
+- \`acme_clerk → acme_rw → acme_ro\` (plus a direct \`acme_clerk → acme_ro\`) with grants in schemas \`billing\` and \`billing_arch\`
 - schema \`cfg\` with audit triggers: \`cfg.fn_config_audit_trg()\` is SECURITY DEFINER and its owner \`audit_owner\` has no USAGE on \`cfg\`; \`cfg.fn_flag_audit_trg()\` is SECURITY INVOKER and the caller \`cfg_user\` cannot insert into its audit table
 HDR
 
@@ -186,6 +187,24 @@ ex "23. SQL-language function" \
     "psql -X -d inspector_test -v role=cfg_user -v function=cfg.fn_config_audit_trg -v table=cfg.app_config -f psql/access_checks.sql"
   psql -X -P pager=off -v role=cfg_user -v function=cfg.fn_config_audit_trg -v table=cfg.app_config -f "$ROOT/psql/access_checks.sql" \
     | sed -n '/^== 7\./,$p' | sed -e 's/[[:space:]]*$//' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+  printf '```\n'
+} >>"$OUT"
+
+ex "25. Full access report for one role" \
+"\`access_report\` lists everything \`acme_clerk\` can do, from role attributes down to columns. \`acme_clerk\` is in \`acme_rw\`, which is in \`acme_ro\`, and is also a direct member of \`acme_ro\`. A privilege that arrives more than one way gets one row per path. \`OWNER\` stands for every privilege on the object plus ALTER, DROP and GRANT. On PostgreSQL 16+ the fixture also grants \`acme_admin\` with \`INHERIT FALSE\`, so its rows say \`needs SET ROLE\`." \
+"SELECT * FROM access_report('acme_clerk', 'billing');"
+
+ex "26. Full access report: NOINHERIT and superuser" \
+"\`report_user\` is NOINHERIT, so nothing from \`reporting\` is active until \`SET ROLE reporting\`. \`p_include_public => false\` hides the PUBLIC rows. A superuser gets one \`superuser\` row instead of a row for every object." \
+"SELECT * FROM access_report('report_user', 'finance', false);
+SELECT * FROM access_report('legacy_su');"
+
+{
+  printf '\n## 27. No-install full access report\n\n%s\n\n```sh\n%s\n```\n\n```text\n' \
+    "Section 9 of the psql file returns the same rows as \`access_report\`:" \
+    "psql -X -d inspector_test -v role=acme_clerk -v report=1 -v schema=billing_arch -f psql/access_checks.sql"
+  psql -X -P pager=off -v role=acme_clerk -v report=1 -v schema=billing_arch -f "$ROOT/psql/access_checks.sql" \
+    | sed -n '/^== 9\./,$p' | sed -e 's/[[:space:]]*$//' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
   printf '```\n'
 } >>"$OUT"
 echo "wrote $OUT"

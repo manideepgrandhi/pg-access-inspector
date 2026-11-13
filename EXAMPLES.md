@@ -12,6 +12,7 @@ The fixture has, among others:
 - `hr_reader` with column grants on `hr.employees`
 - `sales.orders` with row level security and one policy for `sales_emea`
 - default privileges for `app_owner` in `sales`, but tables there are also created by `etl_owner`
+- `acme_clerk → acme_rw → acme_ro` (plus a direct `acme_clerk → acme_ro`) with grants in schemas `billing` and `billing_arch`
 - schema `cfg` with audit triggers: `cfg.fn_config_audit_trg()` is SECURITY DEFINER and its owner `audit_owner` has no USAGE on `cfg`; `cfg.fn_flag_audit_trg()` is SECURITY INVOKER and the caller `cfg_user` cannot insert into its audit table
 
 ## 1. Multi-level inheritance: where does the access come from?
@@ -288,6 +289,7 @@ SELECT role_name, severity, flag, detail FROM access_red_flags();
  locked_user    | HIGH     | connection limit 0         | CONNECTION LIMIT 0: every login is refused
  nocon_user     | HIGH     | cannot CONNECT             | login role without CONNECT on database inspector_test
  old_contractor | HIGH     | password expired           | VALID UNTIL 2020-01-01 00:00:00+00 is in the past: password logins fail
+ acme_clerk     | MEDIUM   | NOINHERIT breaks the chain | privileges of acme_admin are not inherited (path acme_clerk → acme_admin); they apply only after SET ROLE acme_admin
  auditor        | MEDIUM   | reads/writes all data      | inherits pg_read_all_data through auditor → pg_read_all_data
  noinh_owner    | MEDIUM   | NOINHERIT breaks the chain | privileges of cfg_writer are not inherited (path noinh_owner → cfg_writer); they apply only after SET ROLE cfg_writer
  ops_user       | MEDIUM   | NOINHERIT breaks the chain | privileges of ops_admin are not inherited (path ops_user → ops_admin); they apply only after SET ROLE ops_admin
@@ -296,6 +298,7 @@ SELECT role_name, severity, flag, detail FROM access_red_flags();
  rls_admin      | MEDIUM   | BYPASSRLS                  | ignores every row level security policy
  app_owner      | INFO     | NOLOGIN                    | NOLOGIN and no members: grants to it reach nobody (expected for an owner-only role)
  audit_owner    | INFO     | NOLOGIN                    | NOLOGIN and no members: grants to it reach nobody (expected for an owner-only role)
+ billing_owner  | INFO     | NOLOGIN                    | NOLOGIN and no members: grants to it reach nobody (expected for an owner-only role)
  cfg_owner      | INFO     | NOLOGIN                    | NOLOGIN and no members: grants to it reach nobody (expected for an owner-only role)
  etl_owner      | INFO     | NOLOGIN                    | NOLOGIN and no members: grants to it reach nobody (expected for an owner-only role)
  ghost_creator  | INFO     | NOLOGIN                    | NOLOGIN and no members: grants to it reach nobody (expected for an owner-only role)
@@ -304,7 +307,7 @@ SELECT role_name, severity, flag, detail FROM access_red_flags();
  postgres       | INFO     | SUPERUSER                  | bypasses every privilege check, RLS included (bootstrap superuser, expected)
  rds_superuser  | INFO     | CREATEROLE                 | can create roles (and before PG16, grant itself almost any role) (managed by AWS RDS)
  sales_owner    | INFO     | NOLOGIN                    | NOLOGIN and no members: grants to it reach nobody (expected for an owner-only role)
-(23 rows)
+(25 rows)
 ```
 
 ## 14. Risky access finder
@@ -326,16 +329,18 @@ SELECT severity, category, name, detail FROM access_risky(3);
  HIGH     | rds_superuser member | dba_team                | inherits rds_superuser: dba_team → rds_superuser
  HIGH     | rds_superuser member | dba_user                | inherits rds_superuser: dba_user → dba_team → rds_superuser
  HIGH     | role attribute       | legacy_su               | SUPERUSER
+ MEDIUM   | PUBLIC grant         | billing.rates           | PUBLIC (every role) has SELECT on table billing.rates
  MEDIUM   | PUBLIC grant         | sales.price_list        | PUBLIC (every role) has SELECT on table sales.price_list
  MEDIUM   | role attribute       | rls_admin               | BYPASSRLS (login role)
  LOW      | PUBLIC grant         | audit                   | PUBLIC has USAGE on schema audit
  LOW      | deep chain           | app_user                | membership chain is 4 levels deep (limit 3): app_user → app_team → app_rw → app_read → app_base
  LOW      | default privileges   | ghost_creator           | creator ghost_creator owns no tables in any schema yet, so these defaults have not applied to anything: check the right role creates objects
+ LOW      | role attribute       | acme_admin              | CREATEDB
  INFO     | role attribute       | postgres                | SUPERUSER (login role) - bootstrap superuser, expected
  INFO     | role attribute       | rds_superuser           | CREATEDB - managed by AWS RDS
  INFO     | role attribute       | rds_superuser           | CREATEROLE - managed by AWS RDS
  INFO     | unused login roles   | (skipped)               | PostgreSQL does not record last login time; use log_connections, pgAudit or CloudWatch logs (RDS) to find unused logins
-(17 rows)
+(19 rows)
 ```
 
 ## 15. Mermaid diagram for a ticket
@@ -616,4 +621,105 @@ Rough text scan: comments and strings are not skipped and there are no line numb
 (1 row)
 
 Run section 7 for each function above: -v function=<function> -v role=<the role that runs the statement>
+```
+
+## 25. Full access report for one role
+
+`access_report` lists everything `acme_clerk` can do, from role attributes down to columns. `acme_clerk` is in `acme_rw`, which is in `acme_ro`, and is also a direct member of `acme_ro`. A privilege that arrives more than one way gets one row per path. `OWNER` stands for every privilege on the object plus ALTER, DROP and GRANT. On PostgreSQL 16+ the fixture also grants `acme_admin` with `INHERIT FALSE`, so its rows say `needs SET ROLE`.
+
+```sql
+SELECT * FROM access_report('acme_clerk', 'billing');
+```
+
+```text
+  level   | object_type |            object_name            | privilege |                   via                   | grant_option
+----------+-------------+-----------------------------------+-----------+-----------------------------------------+--------------
+ role     | attribute   | acme_admin                        | CREATEDB  | needs SET ROLE: acme_clerk → acme_admin | f
+ role     | attribute   | acme_clerk                        | LOGIN     | direct                                  | f
+ role     | member of   | acme_admin                        | MEMBER    | needs SET ROLE: acme_clerk → acme_admin | f
+ role     | member of   | acme_ro                           | MEMBER    | acme_clerk → acme_ro                    | f
+ role     | member of   | acme_ro                           | MEMBER    | acme_clerk → acme_rw → acme_ro          | f
+ role     | member of   | acme_rw                           | MEMBER    | acme_clerk → acme_rw                    | f
+ database | database    | inspector_test                    | CONNECT   | acme_clerk → acme_ro                    | f
+ database | database    | inspector_test                    | CONNECT   | acme_clerk → acme_rw → acme_ro          | f
+ database | database    | inspector_test                    | TEMPORARY | acme_clerk → acme_rw                    | f
+ database | database    | inspector_test                    | TEMPORARY | PUBLIC                                  | f
+ database | database    | postgres                          | CONNECT   | PUBLIC                                  | f
+ database | database    | postgres                          | TEMPORARY | PUBLIC                                  | f
+ schema   | schema      | billing                           | CREATE    | acme_clerk → acme_rw                    | f
+ schema   | schema      | billing                           | USAGE     | acme_clerk → acme_ro                    | f
+ schema   | schema      | billing                           | USAGE     | acme_clerk → acme_rw → acme_ro          | f
+ object   | column      | billing.clients.id                | SELECT    | acme_clerk → acme_ro                    | f
+ object   | column      | billing.clients.id                | SELECT    | acme_clerk → acme_rw → acme_ro          | f
+ object   | column      | billing.clients.name              | SELECT    | acme_clerk → acme_ro                    | f
+ object   | column      | billing.clients.name              | SELECT    | acme_clerk → acme_rw → acme_ro          | f
+ object   | function    | billing.fn_invoice_total(integer) | EXECUTE   | acme_clerk → acme_rw                    | f
+ object   | sequence    | billing.invoices_id_seq           | USAGE     | acme_clerk → acme_rw                    | f
+ object   | table       | billing.clerk_notes               | OWNER     | owner                                   | t
+ object   | table       | billing.clients                   | SELECT    | needs SET ROLE: acme_clerk → acme_admin | f
+ object   | table       | billing.invoices                  | INSERT    | acme_clerk → acme_rw                    | f
+ object   | table       | billing.invoices                  | SELECT    | direct                                  | f
+ object   | table       | billing.invoices                  | SELECT    | acme_clerk → acme_ro                    | f
+ object   | table       | billing.invoices                  | SELECT    | acme_clerk → acme_rw → acme_ro          | f
+ object   | table       | billing.invoices                  | UPDATE    | acme_clerk → acme_rw                    | f
+ object   | table       | billing.rates                     | SELECT    | PUBLIC                                  | f
+ object   | view        | billing.invoice_summary           | OWNER     | acme_clerk → acme_rw (owner)            | t
+(30 rows)
+```
+
+## 26. Full access report: NOINHERIT and superuser
+
+`report_user` is NOINHERIT, so nothing from `reporting` is active until `SET ROLE reporting`. `p_include_public => false` hides the PUBLIC rows. A superuser gets one `superuser` row instead of a row for every object.
+
+```sql
+SELECT * FROM access_report('report_user', 'finance', false);
+SELECT * FROM access_report('legacy_su');
+```
+
+```text
+  level   | object_type |  object_name   | privilege |                   via                   | grant_option
+----------+-------------+----------------+-----------+-----------------------------------------+--------------
+ role     | attribute   | report_user    | LOGIN     | direct                                  | f
+ role     | member of   | reporting      | MEMBER    | needs SET ROLE: report_user → reporting | f
+ database | database    | inspector_test | CONNECT   | direct                                  | f
+ schema   | schema      | finance        | USAGE     | needs SET ROLE: report_user → reporting | f
+ object   | table       | finance.ledger | SELECT    | needs SET ROLE: report_user → reporting | f
+(5 rows)
+
+ level | object_type | object_name | privilege |                                                  via                                                  | grant_option
+-------+-------------+-------------+-----------+-------------------------------------------------------------------------------------------------------+--------------
+ role  | superuser   | *           | ALL       | SUPERUSER attribute: bypasses every privilege check (database, schema and object rows are not listed) | t
+ role  | attribute   | legacy_su   | SUPERUSER | direct                                                                                                | f
+(2 rows)
+```
+
+## 27. No-install full access report
+
+Section 9 of the psql file returns the same rows as `access_report`:
+
+```sh
+psql -X -d inspector_test -v role=acme_clerk -v report=1 -v schema=billing_arch -f psql/access_checks.sql
+```
+
+```text
+== 9. Full access report for acme_clerk (role, database, schema and object level; one row per path)
+  level   | object_type |        object_name        | privilege |                   via                   | grant_option
+----------+-------------+---------------------------+-----------+-----------------------------------------+--------------
+ role     | attribute   | acme_admin                | CREATEDB  | needs SET ROLE: acme_clerk → acme_admin | f
+ role     | attribute   | acme_clerk                | LOGIN     | direct                                  | f
+ role     | member of   | acme_admin                | MEMBER    | needs SET ROLE: acme_clerk → acme_admin | f
+ role     | member of   | acme_ro                   | MEMBER    | acme_clerk → acme_ro                    | f
+ role     | member of   | acme_ro                   | MEMBER    | acme_clerk → acme_rw → acme_ro          | f
+ role     | member of   | acme_rw                   | MEMBER    | acme_clerk → acme_rw                    | f
+ database | database    | inspector_test            | CONNECT   | acme_clerk → acme_ro                    | f
+ database | database    | inspector_test            | CONNECT   | acme_clerk → acme_rw → acme_ro          | f
+ database | database    | inspector_test            | TEMPORARY | acme_clerk → acme_rw                    | f
+ database | database    | inspector_test            | TEMPORARY | PUBLIC                                  | f
+ database | database    | postgres                  | CONNECT   | PUBLIC                                  | f
+ database | database    | postgres                  | TEMPORARY | PUBLIC                                  | f
+ schema   | schema      | billing_arch              | USAGE     | acme_clerk → acme_ro                    | f
+ schema   | schema      | billing_arch              | USAGE     | acme_clerk → acme_rw → acme_ro          | f
+ object   | table       | billing_arch.old_invoices | SELECT    | acme_clerk → acme_ro                    | f
+ object   | table       | billing_arch.old_invoices | SELECT    | acme_clerk → acme_rw → acme_ro          | f
+(16 rows)
 ```

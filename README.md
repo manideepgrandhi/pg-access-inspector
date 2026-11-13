@@ -33,6 +33,7 @@ writes data or changes grants.
 | `access_tree(role [, 'up' \| 'down'])` | Indented membership tree. `up` = what it belongs to, `down` = who is under a group role |
 | `access_tree_mermaid(role [, 'up' \| 'down'])` | The same graph as Mermaid text for tickets and wikis |
 | `access_privileges(role [, include_public])` | Everything the role can use (databases, schemas, tables, columns, sequences, functions) and where each privilege comes from |
+| `access_report(role [, schema [, include_public]])` | Full access report: role attributes and memberships, then CONNECT / CREATE / TEMP on every database, schema USAGE / CREATE, and table, view, sequence, column, function and procedure privileges, with one row per path (`direct`, `owner`, `PUBLIC`, `app_user → app_rw → app_read`, or `needs SET ROLE: ...`) |
 | `access_who_can(object, action [, object_type])` | Reverse lookup: which roles can do it, and through which role |
 | `access_default_privileges(role [, schema])` | What new objects will grant the role, per creator and schema, plus creators whose new tables it will **not** be able to read |
 | `access_compare(role_a, role_b [, object])` | Memberships, attributes and privileges one role has and the other lacks |
@@ -217,6 +218,45 @@ the sequences behind `nextval()` column defaults, because those run with the
 inserting role's privileges. Database CONNECT is not checked inside functions:
 the session is already connected.
 
+## Full access report
+
+`access_report(role [, schema [, include_public]])` answers "what can this
+role do, and where does each privilege come from?" in one call, top to
+bottom:
+
+| `level` | What is listed |
+|---|---|
+| `role` | The role's own attributes (SUPERUSER, CREATEROLE, CREATEDB, BYPASSRLS, LOGIN, REPLICATION), every role it belongs to (`member of`, or `predefined role` for `pg_*` and `rds_*`), and attributes of those roles, which always need `SET ROLE` |
+| `database` | CONNECT, CREATE, TEMPORARY on every non-template database in the cluster, PUBLIC defaults included, and databases it owns |
+| `schema` | USAGE and CREATE on schemas in the current database, and schemas it owns |
+| `object` | Tables, partitioned tables, views, materialized views, foreign tables, sequences, functions, procedures and aggregates, explicit column grants, and objects it owns |
+
+```sql
+SELECT * FROM access_report('app_user');                    -- everything
+SELECT * FROM access_report('app_user', 'sales');           -- one schema
+SELECT * FROM access_report('app_user', 'sales', false);    -- without PUBLIC rows
+SELECT * FROM access_report('app_user') WHERE via NOT LIKE 'needs SET ROLE%' AND via NOT LIKE 'not usable%';  -- active only
+```
+
+How to read `via`:
+
+- `direct`: granted to the role itself. `owner`: the role owns the object.
+- `PUBLIC`: every role has it (hide with `include_public => false`).
+- `app_user → app_rw → app_read`: inherited through that chain. When the same
+  privilege arrives along several paths, each path is its own row.
+- `... (owner)`: a role in the chain owns the object.
+- `needs SET ROLE: ...`: the path has a hop that does not inherit (a NOINHERIT
+  member, or a PG16+ grant `WITH INHERIT FALSE`). Not active until the session
+  runs `SET ROLE`.
+- `not usable (no INHERIT, no SET): ...`: PG16+ grant with both options off.
+
+`OWNER` stands for every privilege on the object plus ALTER, DROP and GRANT,
+so the owner's own ACL entries are not repeated. A superuser gets one
+`superuser` row instead of a row per object. Column rows appear only for
+column-level grants; a table-level grant already covers every column.
+`schema` limits the `schema` and `object` rows; `role` and `database` rows are
+always cluster-wide. Object rows cover only the database you are connected to.
+
 ## No-install version
 
 For databases where you cannot create functions,
@@ -239,6 +279,13 @@ runs as:
 
 ```sh
 psql -X -d mydb -v role=app_user -v function=cfg.fn_config_audit_trg -v table=cfg.app_config -f psql/access_checks.sql
+```
+
+Add `-v report=1` for section 9, the same rows as `access_report`, optionally
+with `-v schema=sales` and `-v include_public=off`:
+
+```sh
+psql -X -d mydb -v role=app_user -v report=1 -v schema=sales -f psql/access_checks.sql
 ```
 
 ## Version notes
@@ -305,13 +352,17 @@ Predefined roles are understood: `pg_read_all_data` and `pg_write_all_data`
   anonymous `DO` blocks have no function to look up.
 - Membership paths are followed to 64 levels. Graphs with a very large number
   of overlapping paths make `access_chain` long, because it lists every path.
+- `access_report` does not expand predefined roles such as
+  `pg_read_all_data` into one row per table; it lists the membership with what
+  it grants. It reads ACLs only: row level security policies are not shown
+  (use `access_why`). Template databases are skipped.
 - Default privilege gaps (`NOT COVERED`) are reported for schemas where the
   role already reads at least one table, and only for tables.
 
 ## Tests
 
 `tests/run_tests.sh` creates a throwaway cluster, loads
-[`tests/fixture.sql`](tests/fixture.sql) (a 4-level chain, a NOINHERIT hop,
+[`tests/fixture.sql`](tests/fixture.sql) (a 4-level chain, a 3-level chain with a second path to the same role, a NOINHERIT hop,
 PG16 SET-only and INHERIT-only memberships, column grants, RLS, default
 privileges per creator, PUBLIC grants, expired and locked roles, a forced
 membership cycle, and a `cfg` schema with SECURITY DEFINER and INVOKER

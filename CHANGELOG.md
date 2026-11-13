@@ -20,9 +20,22 @@ All notable changes to this project are documented here. The format follows
 - `access_trigger_check(table [, caller_role])`: every user trigger on a table
   with timing, events and enabled state, the caller's own privilege for the
   triggering events, and `access_function_check` for each trigger function.
+- `access_report(role [, schema [, include_public]])`: full access report,
+  one row per privilege per membership path, at role level (attributes,
+  memberships, predefined roles such as `pg_read_all_data` and
+  `rds_superuser`), database level (CONNECT, CREATE, TEMPORARY on every
+  database, PUBLIC defaults, ownership), schema level and object level
+  (tables, views, materialized views, foreign tables, sequences, functions,
+  procedures, column grants, ownership). `via` is `direct`, `owner`, `PUBLIC`
+  or the full chain; paths through a NOINHERIT member or a PG16+ `INHERIT
+  FALSE` grant are labeled `needs SET ROLE: ...`. A superuser gets a single
+  `superuser` row. `schema` limits schema and object rows; `include_public =>
+  false` drops PUBLIC rows.
+- `psql/access_checks.sql`: section 9 (`-v report=1`, optional `-v schema=...`
+  and `-v include_public=off`), the same rows as `access_report`.
 - `psql/access_checks.sql`: sections 7 (`-v function=...`) and 8
   (`-v table=...`) for a function's effective role and a table's triggers.
-- Tests for both, verified against the server, on PostgreSQL 14 to 17.
+- Tests for all three, verified against the server, on PostgreSQL 14 to 17.
 
 ### Changed
 - `access_explain_error` reads `CONTEXT:` / `Where:` lines (`PL/pgSQL function

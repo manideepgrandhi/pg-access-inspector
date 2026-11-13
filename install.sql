@@ -1752,6 +1752,163 @@ AS $fn$
 $fn$;
 
 -- ---------------------------------------------------------------------------
+-- 3a. access_report(role [, schema [, include_public]]): full access report
+-- One row per privilege per path, from role level down to columns. Every
+-- membership path is its own row (access__walk, not access__reach), so a
+-- privilege that arrives two ways is listed twice. Paths with a hop that does
+-- not inherit are labeled 'needs SET ROLE: ...' (or 'not usable ...' when SET
+-- is off too) and sort after the active rows. A superuser gets one row that
+-- says so instead of every object in the database.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.access_report(p_role text, p_schema text DEFAULT NULL,
+                                                p_include_public boolean DEFAULT true)
+RETURNS TABLE(level text, object_type text, object_name text, privilege text,
+              via text, grant_option boolean)
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  v_role oid := public.access__role(p_role);
+BEGIN
+  IF p_schema IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname = p_schema) THEN
+    RAISE EXCEPTION 'pg-access-inspector: schema "%" does not exist in database %', p_schema, current_database()
+      USING HINT = 'Schema names are case-sensitive and per database. List schemas with \dn.';
+  END IF;
+  RETURN QUERY
+  WITH me AS (SELECT r.oid AS id, r.* FROM pg_roles r WHERE r.oid = v_role),
+  -- every non-cycling membership path, including the role itself (depth 0)
+  p AS (
+    SELECT w.roleid, w.depth, w.path_text, w.inherits, w.settable, w.hop_admin,
+           CASE WHEN w.inherits THEN 0 WHEN w.settable THEN 1 ELSE 2 END AS state
+      FROM public.access__walk(v_role, 'up') w
+     WHERE NOT w.is_cycle
+  ),
+  objs AS (
+    SELECT 2 AS lvl, 'database'::text AS t, quote_ident(d.datname) AS nm, d.datdba AS own,
+           COALESCE(d.datacl, acldefault('d', d.datdba)) AS acl
+      FROM pg_database d
+     WHERE NOT d.datistemplate
+    UNION ALL
+    SELECT 3, 'schema', quote_ident(n.nspname), n.nspowner, COALESCE(n.nspacl, acldefault('n', n.nspowner))
+      FROM pg_namespace n
+     WHERE NOT public.access__is_system_schema(n.nspname)
+       AND (p_schema IS NULL OR n.nspname = p_schema)
+    UNION ALL
+    SELECT 4, CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' WHEN 'v' THEN 'view'
+                             WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence'
+                             WHEN 'f' THEN 'foreign table' END,
+           format('%I.%I', n.nspname, c.relname), c.relowner,
+           COALESCE(c.relacl, acldefault(CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END::"char", c.relowner))
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+       AND NOT public.access__is_system_schema(n.nspname)
+       AND (p_schema IS NULL OR n.nspname = p_schema)
+    UNION ALL
+    -- explicit column grants only (a table-level grant already covers every column)
+    SELECT 4, 'column', format('%I.%I.%I', n.nspname, c.relname, a.attname), c.relowner, a.attacl
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE a.attacl IS NOT NULL AND a.attnum > 0 AND NOT a.attisdropped
+       AND NOT public.access__is_system_schema(n.nspname)
+       AND (p_schema IS NULL OR n.nspname = p_schema)
+    UNION ALL
+    SELECT 4, CASE pr.prokind WHEN 'p' THEN 'procedure' WHEN 'a' THEN 'aggregate'
+                              WHEN 'w' THEN 'window function' ELSE 'function' END,
+           pr.oid::regprocedure::text, pr.proowner, COALESCE(pr.proacl, acldefault('f', pr.proowner))
+      FROM pg_proc pr
+      JOIN pg_namespace n ON n.oid = pr.pronamespace
+     WHERE NOT public.access__is_system_schema(n.nspname)
+       AND (p_schema IS NULL OR n.nspname = p_schema)
+       AND COALESCE(obj_description(pr.oid, 'pg_proc'), '') NOT LIKE 'pg-access-inspector:%'
+  ),
+  acl AS (
+    SELECT o.lvl, o.t, o.nm, o.own, e.grantee, e.privilege_type AS priv, bool_or(e.is_grantable) AS grantable
+      FROM objs o, aclexplode(o.acl) e
+     GROUP BY o.lvl, o.t, o.nm, o.own, e.grantee, e.privilege_type
+  ),
+  rows AS (
+    -- role attributes of the role itself
+    SELECT 1 AS lvl, 'attribute'::text AS t, me.rolname::text AS nm, a.attr AS priv,
+           'direct'::text AS via, false AS grantable, 0 AS state
+      FROM me
+      CROSS JOIN LATERAL (VALUES (me.rolsuper, 'SUPERUSER'), (me.rolcreaterole, 'CREATEROLE'),
+                                 (me.rolcreatedb, 'CREATEDB'), (me.rolbypassrls, 'BYPASSRLS'),
+                                 (me.rolcanlogin, 'LOGIN'), (me.rolreplication, 'REPLICATION')) a(isset, attr)
+     WHERE a.isset
+    UNION ALL
+    SELECT 1, 'superuser', '*', 'ALL',
+           'SUPERUSER attribute: bypasses every privilege check (database, schema and object rows are not listed)',
+           true, 0
+      FROM me WHERE me.rolsuper
+    UNION ALL
+    -- attributes of groups are never inherited: SET ROLE is always needed
+    SELECT 1, 'attribute', r.rolname::text, a.attr,
+           CASE WHEN p.settable THEN 'needs SET ROLE: ' ELSE 'not usable (no INHERIT, no SET): ' END || p.path_text,
+           false, CASE WHEN p.settable THEN 1 ELSE 2 END
+      FROM p
+      JOIN pg_roles r ON r.oid = p.roleid
+      CROSS JOIN LATERAL (VALUES (r.rolsuper, 'SUPERUSER'), (r.rolcreaterole, 'CREATEROLE'),
+                                 (r.rolcreatedb, 'CREATEDB'), (r.rolbypassrls, 'BYPASSRLS'),
+                                 (r.rolreplication, 'REPLICATION')) a(isset, attr)
+     WHERE p.depth > 0 AND a.isset
+    UNION ALL
+    -- memberships: predefined roles (pg_*, rds_*) and ordinary group roles
+    SELECT 1, CASE WHEN r.rolname ~ '^(pg|rds)_' THEN 'predefined role' ELSE 'member of' END,
+           r.rolname::text,
+           CASE r.rolname
+             WHEN 'pg_read_all_data'  THEN 'SELECT on all tables, views and sequences; USAGE on all schemas'
+             WHEN 'pg_write_all_data' THEN 'INSERT, UPDATE, DELETE on all tables, views and sequences; USAGE on all schemas'
+             WHEN 'pg_maintain'       THEN 'VACUUM, ANALYZE, REINDEX, REFRESH, CLUSTER, LOCK on all relations'
+             WHEN 'pg_database_owner' THEN 'owner of the current database'
+             WHEN 'rds_superuser'     THEN 'RDS/Aurora admin role (not a real superuser)'
+             ELSE 'MEMBER' END,
+           CASE p.state WHEN 0 THEN p.path_text
+                        WHEN 1 THEN 'needs SET ROLE: ' || p.path_text
+                        ELSE 'not usable (no INHERIT, no SET): ' || p.path_text END,
+           COALESCE(p.hop_admin, false), p.state
+      FROM p
+      JOIN pg_roles r ON r.oid = p.roleid
+     WHERE p.depth > 0
+    UNION ALL
+    -- database, schema and object privileges from the ACLs. The owner's own
+    -- ACL entries are folded into the single OWNER row below.
+    SELECT a.lvl, a.t, a.nm,
+           a.priv,
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                WHEN p.depth = 0 THEN 'direct'
+                ELSE CASE p.state WHEN 0 THEN '' WHEN 1 THEN 'needs SET ROLE: '
+                                  ELSE 'not usable (no INHERIT, no SET): ' END || p.path_text
+           END,
+           a.grantable, COALESCE(p.state, 0)
+      FROM acl a
+      LEFT JOIN p ON p.roleid = a.grantee
+     WHERE ((a.grantee = 0 AND p_include_public) OR p.roleid IS NOT NULL)
+       AND a.grantee <> a.own
+    UNION ALL
+    -- ownership: every privilege on the object plus ALTER, DROP and GRANT
+    SELECT o.lvl, o.t, o.nm, 'OWNER',
+           CASE WHEN p.depth = 0 THEN 'owner'
+                ELSE CASE p.state WHEN 0 THEN '' WHEN 1 THEN 'needs SET ROLE: '
+                                  ELSE 'not usable (no INHERIT, no SET): ' END || p.path_text || ' (owner)' END,
+           true, p.state
+      FROM objs o
+      JOIN p ON p.roleid = o.own
+     WHERE o.t <> 'column'
+  )
+  SELECT CASE rows.lvl WHEN 1 THEN 'role' WHEN 2 THEN 'database' WHEN 3 THEN 'schema' ELSE 'object' END,
+         rows.t, rows.nm, rows.priv, rows.via, rows.grantable
+    FROM rows
+   WHERE rows.lvl = 1 OR NOT EXISTS (SELECT 1 FROM me WHERE me.rolsuper)
+   ORDER BY rows.lvl, rows.t = 'superuser' DESC, rows.t, rows.nm, rows.priv = 'OWNER' DESC, rows.priv,
+            rows.state, CASE WHEN rows.via IN ('direct', 'owner') THEN 0 WHEN rows.via = 'PUBLIC' THEN 2 ELSE 1 END,
+            rows.via;
+END
+$fn$;
+
+-- ---------------------------------------------------------------------------
 -- 4. access_default_privileges(role [, schema]): what NEW objects will give it
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.access_default_privileges(p_role text, p_schema text DEFAULT NULL)
@@ -2872,6 +3029,7 @@ AS $fn$
     ('access_tree', 'indented membership tree (up = belongs to, down = members)', 'SELECT * FROM access_tree(''app_user'');'),
     ('access_tree_mermaid', 'the same tree as a Mermaid graph', 'SELECT access_tree_mermaid(''app_user'');'),
     ('access_privileges', 'everything a role can use, and which role it comes from', 'SELECT * FROM access_privileges(''app_user'', false);'),
+    ('access_report', 'full access report for a role: role attributes and memberships, then database, schema and object privileges, one row per path (inherited, PUBLIC, owner, needs SET ROLE)', 'SELECT * FROM access_report(''app_user'', ''sales'');'),
     ('access_who_can', 'reverse lookup: roles that can do ACTION on OBJECT', 'SELECT * FROM access_who_can(''sales.orders'', ''SELECT'');'),
     ('access_default_privileges', 'what NEW objects will grant the role, per creator and schema', 'SELECT * FROM access_default_privileges(''app_user'');'),
     ('access_compare', 'what one role has and the other lacks', 'SELECT * FROM access_compare(''app_user'', ''app_user2'');'),
@@ -2904,6 +3062,7 @@ COMMENT ON FUNCTION public.access__function_check(oid, oid) IS 'pg-access-inspec
 COMMENT ON FUNCTION public.access_chain(text) IS 'pg-access-inspector: every role a role belongs to, with path and INHERIT/SET per hop';
 COMMENT ON FUNCTION public.access_why(text, text, text, text) IS 'pg-access-inspector: can a role do an action on an object, and why (not)';
 COMMENT ON FUNCTION public.access_privileges(text, boolean) IS 'pg-access-inspector: effective privileges of a role with their source';
+COMMENT ON FUNCTION public.access_report(text, text, boolean) IS 'pg-access-inspector: full access report: role, database, schema and object level, one row per privilege per path';
 COMMENT ON FUNCTION public.access_default_privileges(text, text) IS 'pg-access-inspector: default privileges that apply to a role, and gaps';
 COMMENT ON FUNCTION public.access_who_can(text, text, text, boolean) IS 'pg-access-inspector: roles that can do an action on an object';
 COMMENT ON FUNCTION public.access_red_flags(text) IS 'pg-access-inspector: problems with one role or every role';

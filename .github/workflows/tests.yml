@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ['14', '15', '16', '17']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install PostgreSQL ${{ matrix.pg }} from PGDG
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo mkdir -p /etc/postgresql-common
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.conf
+          sudo apt-get install -y -q "postgresql-${{ matrix.pg }}"
+
+      - name: Run tests
+        env:
+          PG_BINDIR: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: tests/run_tests.sh

@@ -1,4 +1,4 @@
--- pg-access-inspector 1.0.0 -- install.sql
+-- pg-access-inspector 1.1.0 (unreleased) -- install.sql
 --
 -- Read-only PostgreSQL access troubleshooting functions.
 -- Installs into the public schema; every object is named access_* (helpers
@@ -256,6 +256,14 @@ BEGIN
         EXCEPTION WHEN others THEN
           v_p := NULL;
         END;
+        IF v_p IS NULL THEN
+          -- to_regprocedure needs USAGE on the schema; fall back to the catalog's own spelling
+          SELECT p.oid INTO v_p
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+           WHERE n.nspname = v_nsp AND p.proname = v_name
+             AND replace(oidvectortypes(p.proargtypes), ' ', '')
+                 = replace(lower(regexp_replace(btrim(v_args), '^\((.*)\)$', '\1')), ' ', '');
+        END IF;
         IF v_p IS NOT NULL THEN
           v_procs := v_procs || v_p;
         END IF;
@@ -750,6 +758,908 @@ END
 $fn$;
 
 -- ---------------------------------------------------------------------------
+-- Function body scanner (best effort, used by access_function_check)
+-- ---------------------------------------------------------------------------
+
+-- Split a function body into tokens, keeping the body line number (line 1 is
+-- the text right after the opening quote, as PL/pgSQL counts in CONTEXT
+-- lines) and the top-level statement number (as SQL functions count them).
+-- kind: w = word (lower-cased), q = "quoted identifier", s = string literal
+-- (content), d = dollar-quoted string (content), n = number, p = punctuation.
+-- Comments are dropped.
+CREATE OR REPLACE FUNCTION public.access__tokens(p_src text)
+RETURNS TABLE(n integer, line integer, stmt integer, kind text, tok text)
+LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  c      text[] := string_to_array(COALESCE(p_src, ''), NULL);
+  len    integer := COALESCE(array_length(string_to_array(COALESCE(p_src, ''), NULL), 1), 0);
+  i      integer := 1;
+  j      integer;
+  ch     text;
+  v_line integer := 1;
+  v_stmt integer := 1;
+  v_depth integer := 0;
+  v_n    integer := 0;
+  v_buf  text;
+  v_tag  text;
+  v_esc  boolean;
+  v_start integer;
+  v_nest integer;
+BEGIN
+  WHILE i <= len LOOP
+    ch := c[i];
+    IF ch = E'\n' THEN
+      v_line := v_line + 1; i := i + 1;
+    ELSIF ch IN (' ', E'\t', E'\r', E'\f') THEN
+      i := i + 1;
+    ELSIF ch = '-' AND i < len AND c[i + 1] = '-' THEN
+      WHILE i <= len AND c[i] <> E'\n' LOOP i := i + 1; END LOOP;
+    ELSIF ch = '/' AND i < len AND c[i + 1] = '*' THEN
+      v_nest := 1; i := i + 2;
+      WHILE i <= len AND v_nest > 0 LOOP
+        IF c[i] = '*' AND i < len AND c[i + 1] = '/' THEN v_nest := v_nest - 1; i := i + 2;
+        ELSIF c[i] = '/' AND i < len AND c[i + 1] = '*' THEN v_nest := v_nest + 1; i := i + 2;
+        ELSE
+          IF c[i] = E'\n' THEN v_line := v_line + 1; END IF;
+          i := i + 1;
+        END IF;
+      END LOOP;
+    ELSIF ch = '''' OR (ch IN ('e', 'E') AND i < len AND c[i + 1] = ''''
+                        AND (i = 1 OR c[i - 1] !~ '[A-Za-z0-9_$]')) THEN
+      v_esc := ch <> '''';
+      IF v_esc THEN i := i + 1; END IF;
+      v_start := v_line; v_buf := ''; i := i + 1;
+      WHILE i <= len LOOP
+        IF v_esc AND c[i] = '\' AND i < len THEN
+          v_buf := v_buf || c[i + 1]; i := i + 2; CONTINUE;
+        END IF;
+        IF c[i] = '''' THEN
+          IF i < len AND c[i + 1] = '''' THEN v_buf := v_buf || ''''; i := i + 2; CONTINUE; END IF;
+          i := i + 1; EXIT;
+        END IF;
+        IF c[i] = E'\n' THEN v_line := v_line + 1; END IF;
+        v_buf := v_buf || c[i]; i := i + 1;
+      END LOOP;
+      v_n := v_n + 1; n := v_n; line := v_start; stmt := v_stmt; kind := 's'; tok := v_buf; RETURN NEXT;
+    ELSIF ch = '$' AND i < len AND c[i + 1] ~ '[A-Za-z_$]' THEN
+      -- dollar quote $tag$ ... $tag$ (a $1 parameter starts with a digit)
+      j := i + 1; v_tag := '$';
+      WHILE j <= len AND c[j] ~ '[A-Za-z0-9_]' LOOP v_tag := v_tag || c[j]; j := j + 1; END LOOP;
+      IF j <= len AND c[j] = '$' THEN
+        v_tag := v_tag || '$';
+        v_start := v_line; v_buf := ''; i := j + 1;
+        WHILE i <= len LOOP
+          IF c[i] = '$' AND array_to_string(c[i:i + length(v_tag) - 1], '') = v_tag THEN
+            i := i + length(v_tag); EXIT;
+          END IF;
+          IF c[i] = E'\n' THEN v_line := v_line + 1; END IF;
+          v_buf := v_buf || c[i]; i := i + 1;
+        END LOOP;
+        v_n := v_n + 1; n := v_n; line := v_start; stmt := v_stmt; kind := 'd'; tok := v_buf; RETURN NEXT;
+      ELSE
+        v_n := v_n + 1; n := v_n; line := v_line; stmt := v_stmt; kind := 'p'; tok := '$'; RETURN NEXT;
+        i := i + 1;
+      END IF;
+    ELSIF ch = '"' THEN
+      v_buf := ''; i := i + 1;
+      WHILE i <= len LOOP
+        IF c[i] = '"' THEN
+          IF i < len AND c[i + 1] = '"' THEN v_buf := v_buf || '"'; i := i + 2; CONTINUE; END IF;
+          i := i + 1; EXIT;
+        END IF;
+        v_buf := v_buf || c[i]; i := i + 1;
+      END LOOP;
+      v_n := v_n + 1; n := v_n; line := v_line; stmt := v_stmt; kind := 'q'; tok := v_buf; RETURN NEXT;
+    ELSIF ch ~ '[A-Za-z_]' OR ascii(ch) > 127 THEN
+      v_buf := '';
+      WHILE i <= len AND (c[i] ~ '[A-Za-z0-9_$]' OR ascii(c[i]) > 127) LOOP v_buf := v_buf || c[i]; i := i + 1; END LOOP;
+      v_n := v_n + 1; n := v_n; line := v_line; stmt := v_stmt; kind := 'w'; tok := lower(v_buf); RETURN NEXT;
+    ELSIF ch ~ '[0-9]' THEN
+      v_buf := '';
+      WHILE i <= len AND c[i] ~ '[0-9.eE]' LOOP v_buf := v_buf || c[i]; i := i + 1; END LOOP;
+      v_n := v_n + 1; n := v_n; line := v_line; stmt := v_stmt; kind := 'n'; tok := v_buf; RETURN NEXT;
+    ELSE
+      IF ch = '(' THEN v_depth := v_depth + 1; ELSIF ch = ')' THEN v_depth := greatest(v_depth - 1, 0); END IF;
+      v_n := v_n + 1; n := v_n; line := v_line; stmt := v_stmt; kind := 'p'; tok := ch; RETURN NEXT;
+      IF ch = ';' AND v_depth = 0 THEN v_stmt := v_stmt + 1; END IF;
+      i := i + 1;
+    END IF;
+  END LOOP;
+END
+$fn$;
+
+-- Qualified name starting at token p_k: returns its parts and the next index.
+CREATE OR REPLACE FUNCTION public.access__name_at(p_kind text[], p_tok text[], p_k integer,
+                                                  OUT parts text[], OUT next_k integer)
+LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+  k   integer := p_k;
+  cnt integer := COALESCE(array_length(p_tok, 1), 0);
+BEGIN
+  parts := NULL; next_k := p_k;
+  IF k > cnt OR p_kind[k] NOT IN ('w', 'q') THEN
+    RETURN;
+  END IF;
+  parts := ARRAY[p_tok[k]]; k := k + 1;
+  WHILE k + 1 <= cnt AND p_kind[k] = 'p' AND p_tok[k] = '.' AND p_kind[k + 1] IN ('w', 'q') LOOP
+    parts := parts || p_tok[k + 1]; k := k + 2;
+  END LOOP;
+  next_k := k;
+END
+$fn$;
+
+-- Objects a function body names, with the privilege each needs and the line.
+-- Pattern based, not a parser: see the README for what it does not see.
+-- ref_type: relation | sequence | function | dynamic
+CREATE OR REPLACE FUNCTION public.access__body_refs(p_src text, p_lang text)
+RETURNS TABLE(line integer, stmt integer, ref_type text, action text, parts text[], written text, note text)
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  t_kind text[]; t_tok text[]; t_line integer[]; t_stmt integer[];
+  cnt    integer;
+  i      integer := 1;
+  k      integer;
+  nm     record;
+  w      text;
+  prev   text;
+  pprev  text;
+  v_kw   text[];
+  v_pl   text[] := ARRAY['if', 'elsif', 'elseif', 'while', 'return', 'perform', 'assert', 'raise', 'exit',
+                         'continue', 'loop', 'foreach', 'query', 'execute', 'get', 'open', 'fetch', 'move',
+                         'close', 'call', 'strict', 'found', 'using', 'array'];
+  v_clause text[] := ARRAY['where', 'join', 'inner', 'left', 'right', 'full', 'cross', 'natural', 'on', 'using',
+                           'group', 'order', 'limit', 'offset', 'union', 'except', 'intersect', 'having',
+                           'window', 'for', 'returning', 'set', 'into', 'values', 'fetch', 'lateral',
+                           'tablesample', 'loop', 'then', 'select', 'and', 'or', 'when', 'end', 'outer'];
+  v_ctes  text[] := ARRAY[]::text[];
+  v_paren text[] := ARRAY[]::text[];
+  v_top   text;
+  v_seqf  text;
+BEGIN
+  SELECT array_agg(x.kind ORDER BY x.n), array_agg(x.tok ORDER BY x.n),
+         array_agg(x.line ORDER BY x.n), array_agg(x.stmt ORDER BY x.n)
+    INTO t_kind, t_tok, t_line, t_stmt
+    FROM public.access__tokens(p_src) x;
+  cnt := COALESCE(array_length(t_tok, 1), 0);
+  SELECT array_agg(word::text) INTO v_kw FROM pg_get_keywords();
+
+  WHILE i <= cnt LOOP
+    w := CASE WHEN t_kind[i] = 'w' THEN t_tok[i] END;
+    prev := CASE WHEN i > 1 AND t_kind[i - 1] IN ('w', 'p') THEN t_tok[i - 1] END;
+    pprev := CASE WHEN i > 2 AND t_kind[i - 2] IN ('w', 'p') THEN t_tok[i - 2] END;
+    v_top := v_paren[array_length(v_paren, 1)];
+
+    IF t_kind[i] = 'p' AND t_tok[i] = '(' THEN
+      v_paren := v_paren || COALESCE(CASE WHEN i > 1 AND t_kind[i - 1] IN ('w', 'q') THEN t_tok[i - 1] END, '');
+      i := i + 1; CONTINUE;
+    ELSIF t_kind[i] = 'p' AND t_tok[i] = ')' THEN
+      v_paren := v_paren[1:greatest(COALESCE(array_length(v_paren, 1), 0) - 1, 0)];
+      i := i + 1; CONTINUE;
+    ELSIF t_kind[i] NOT IN ('w', 'q') THEN
+      i := i + 1; CONTINUE;
+    END IF;
+
+    line := t_line[i]; stmt := t_stmt[i]; note := NULL;
+
+    -- INSERT INTO name / MERGE INTO name
+    IF w IN ('insert', 'merge') AND i < cnt AND t_kind[i + 1] = 'w' AND t_tok[i + 1] = 'into' THEN
+      nm := public.access__name_at(t_kind, t_tok, i + 2);
+      IF nm.parts IS NOT NULL THEN
+        ref_type := 'relation'; parts := nm.parts; written := array_to_string(nm.parts, '.');
+        IF w = 'insert' THEN
+          action := 'INSERT'; RETURN NEXT;
+        ELSE
+          note := 'MERGE target: needs the privilege of each WHEN action it uses';
+          FOREACH action IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP RETURN NEXT; END LOOP;
+        END IF;
+        i := nm.next_k; CONTINUE;
+      END IF;
+    END IF;
+
+    -- UPDATE [ONLY] name   (not FOR UPDATE, ON UPDATE, DO UPDATE, INSERT OR UPDATE, GRANT UPDATE ...)
+    IF w = 'update' AND COALESCE(prev, '') NOT IN ('for', 'on', 'do', 'key', 'of', 'no', 'or', 'before', 'after',
+                                                   'instead', 'grant', 'revoke', ',') THEN
+      k := i + 1;
+      IF k <= cnt AND t_kind[k] = 'w' AND t_tok[k] = 'only' THEN k := k + 1; END IF;
+      nm := public.access__name_at(t_kind, t_tok, k);
+      IF nm.parts IS NOT NULL AND NOT (t_kind[k] = 'w' AND t_tok[k] = 'set') THEN
+        ref_type := 'relation'; action := 'UPDATE'; parts := nm.parts;
+        written := array_to_string(nm.parts, '.'); RETURN NEXT;
+        i := nm.next_k; CONTINUE;
+      END IF;
+    END IF;
+
+    -- DELETE FROM [ONLY] name
+    IF w = 'delete' AND i < cnt AND t_kind[i + 1] = 'w' AND t_tok[i + 1] = 'from' THEN
+      k := i + 2;
+      IF k <= cnt AND t_kind[k] = 'w' AND t_tok[k] = 'only' THEN k := k + 1; END IF;
+      nm := public.access__name_at(t_kind, t_tok, k);
+      IF nm.parts IS NOT NULL THEN
+        ref_type := 'relation'; action := 'DELETE'; parts := nm.parts;
+        written := array_to_string(nm.parts, '.'); RETURN NEXT;
+        i := nm.next_k; CONTINUE;
+      END IF;
+    END IF;
+
+    -- TRUNCATE [TABLE] [ONLY] name [, ...]
+    IF w = 'truncate' AND COALESCE(prev, '') NOT IN ('grant', 'revoke', ',', 'or', 'before', 'after') THEN
+      k := i + 1;
+      IF k <= cnt AND t_kind[k] = 'w' AND t_tok[k] = 'table' THEN k := k + 1; END IF;
+      LOOP
+        IF k <= cnt AND t_kind[k] = 'w' AND t_tok[k] = 'only' THEN k := k + 1; END IF;
+        nm := public.access__name_at(t_kind, t_tok, k);
+        EXIT WHEN nm.parts IS NULL;
+        line := t_line[k];
+        ref_type := 'relation'; action := 'TRUNCATE'; parts := nm.parts;
+        written := array_to_string(nm.parts, '.'); RETURN NEXT;
+        k := nm.next_k;
+        EXIT WHEN NOT (k <= cnt AND t_kind[k] = 'p' AND t_tok[k] = ',');
+        k := k + 1;
+      END LOOP;
+      i := k; CONTINUE;
+    END IF;
+
+    -- FROM / JOIN name [alias] [, name ...]   (not IS DISTINCT FROM, EXTRACT(x FROM y), FETCH n FROM cur)
+    IF w IN ('from', 'join')
+       AND COALESCE(prev, '') NOT IN ('distinct', 'next', 'prior', 'first', 'last', 'absolute', 'relative',
+                                      'forward', 'backward', 'all')
+       AND COALESCE(v_top, '') NOT IN ('extract', 'substring', 'trim', 'overlay', 'position', 'normalize') THEN
+      k := i + 1;
+      LOOP
+        WHILE k <= cnt AND t_kind[k] = 'w' AND t_tok[k] IN ('only', 'lateral') LOOP k := k + 1; END LOOP;
+        nm := public.access__name_at(t_kind, t_tok, k);
+        EXIT WHEN nm.parts IS NULL;
+        -- a function call in FROM is picked up by the call rule below
+        EXIT WHEN nm.next_k <= cnt AND t_kind[nm.next_k] = 'p' AND t_tok[nm.next_k] = '(';
+        IF NOT (array_length(nm.parts, 1) = 1 AND nm.parts[1] = ANY (v_ctes))
+           AND NOT (array_length(nm.parts, 1) > 1 AND t_kind[k] = 'w' AND nm.parts[1] IN ('new', 'old', 'excluded'))
+           AND NOT (array_length(nm.parts, 1) = 1 AND t_kind[k] = 'w' AND nm.parts[1] = ANY (v_clause)) THEN
+          line := t_line[k];
+          ref_type := 'relation'; action := 'SELECT'; parts := nm.parts;
+          written := array_to_string(nm.parts, '.'); RETURN NEXT;
+        END IF;
+        k := nm.next_k;
+        IF k <= cnt AND t_kind[k] = 'w' AND t_tok[k] = 'as' THEN
+          k := k + 2;
+        ELSIF k <= cnt AND t_kind[k] IN ('w', 'q') AND NOT (t_kind[k] = 'w' AND t_tok[k] = ANY (v_clause)) THEN
+          k := k + 1;
+        END IF;
+        EXIT WHEN NOT (k <= cnt AND t_kind[k] = 'p' AND t_tok[k] = ',');
+        k := k + 1;
+      END LOOP;
+      i := k; CONTINUE;
+    END IF;
+
+    -- nextval('seq') / currval('seq') / setval('seq', ...)
+    IF w IN ('nextval', 'currval', 'setval') AND COALESCE(prev, '') <> '.' AND i + 1 <= cnt
+       AND t_kind[i + 1] = 'p' AND t_tok[i + 1] = '(' THEN
+      action := CASE w WHEN 'nextval' THEN 'USAGE' WHEN 'currval' THEN 'SELECT' ELSE 'UPDATE' END;
+      written := w || '(...)';
+      IF i + 2 <= cnt AND t_kind[i + 2] = 's' THEN
+        BEGIN
+          parts := parse_ident(t_tok[i + 2]);
+        EXCEPTION WHEN others THEN
+          parts := string_to_array(t_tok[i + 2], '.');
+        END;
+        ref_type := 'sequence'; written := format('%s(%L)', w, t_tok[i + 2]);
+      ELSE
+        ref_type := 'dynamic'; parts := NULL;
+        note := 'the sequence name is not a literal: it is only known at run time';
+      END IF;
+      RETURN NEXT;
+      i := i + 1; CONTINUE;
+    END IF;
+
+    -- dynamic SQL
+    IF w = 'execute' AND lower(COALESCE(p_lang, '')) = 'plpgsql'
+       AND COALESCE(prev, '') NOT IN ('grant', 'revoke', ',', 'on')
+       AND NOT (i < cnt AND t_kind[i + 1] = 'w' AND t_tok[i + 1] IN ('function', 'procedure', 'on')) THEN
+      ref_type := 'dynamic'; action := NULL; parts := NULL; written := 'EXECUTE';
+      note := 'dynamic SQL: the statement text is built at run time';
+      RETURN NEXT;
+      i := i + 1; CONTINUE;
+    END IF;
+
+    -- CTE names: WITH x AS (...), y AS (...)
+    IF i + 2 <= cnt AND t_kind[i + 1] = 'w' AND t_tok[i + 1] = 'as'
+       AND ((t_kind[i + 2] = 'p' AND t_tok[i + 2] = '(') OR (t_kind[i + 2] = 'w' AND t_tok[i + 2] IN ('materialized', 'not')))
+       AND COALESCE(prev, '') IN ('with', ',', 'recursive') THEN
+      v_ctes := v_ctes || t_tok[i];
+      i := i + 1; CONTINUE;
+    END IF;
+
+    -- function / procedure calls: name(...)
+    nm := public.access__name_at(t_kind, t_tok, i);
+    IF COALESCE(prev, '') <> '.' AND nm.next_k <= cnt AND t_kind[nm.next_k] = 'p' AND t_tok[nm.next_k] = '('
+       AND COALESCE(prev, '') NOT IN ('table', 'type', 'function', 'procedure', 'trigger', 'index', 'view',
+                                      'returns', 'domain', 'aggregate', 'routine') THEN
+      IF array_length(nm.parts, 1) = 1 AND t_kind[i] = 'w' AND (w = ANY (v_kw) OR w = ANY (v_pl)) THEN
+        NULL;  -- keyword such as VALUES (, IN (, COALESCE (
+      ELSIF array_length(nm.parts, 1) = 1
+            AND EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = 'pg_catalog'::regnamespace
+                                                 AND p.proname = nm.parts[1]) THEN
+        NULL;  -- built-in function (pg_catalog is searched first)
+      ELSIF nm.parts[1] = 'pg_catalog' THEN
+        NULL;
+      ELSIF array_length(nm.parts, 1) > 1 AND t_kind[i] = 'w' AND nm.parts[1] IN ('new', 'old') THEN
+        NULL;
+      ELSE
+        ref_type := 'function'; action := 'EXECUTE'; parts := nm.parts;
+        written := array_to_string(nm.parts, '.') || '(...)';
+        RETURN NEXT;
+      END IF;
+    END IF;
+    i := greatest(nm.next_k, i + 1);
+  END LOOP;
+END
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- 2b. access_function_check(function [, caller_role]): whose access counts
+--     inside a function, and can that role reach every object the body names
+-- ---------------------------------------------------------------------------
+-- Relations / routines named p_name in one schema, or (p_schema NULL) in
+-- pg_catalog and every non-system schema. kind: relation | function | procedure
+CREATE OR REPLACE FUNCTION public.access__find(p_type text, p_schema text, p_name text)
+RETURNS TABLE(obj text, kind text)
+LANGUAGE sql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+  SELECT format('%I.%I', n.nspname, c.relname), 'relation'
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE p_type IN ('relation', 'sequence') AND c.relname = p_name
+     AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+     AND CASE WHEN p_schema IS NULL THEN NOT public.access__is_system_schema(n.nspname) OR n.nspname = 'pg_catalog'
+              ELSE n.nspname = p_schema END
+  UNION ALL
+  SELECT p.oid::regprocedure::text, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE p_type = 'function' AND p.proname = p_name
+     AND CASE WHEN p_schema IS NULL THEN NOT public.access__is_system_schema(n.nspname)
+              ELSE n.nspname = p_schema END
+$fn$;
+
+CREATE OR REPLACE FUNCTION public.access__function_check(p_func oid, p_caller oid)
+RETURNS TABLE(function_name text, step integer, check_name text, line integer, object text, action text,
+              result text, detail text, suggested_fix text, source_line text)
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  f          record;
+  r          record;
+  c          record;
+  y          record;
+  v_n        integer := 0;
+  v_eff      oid;
+  v_effname  text;
+  v_caller   text;
+  v_src      text;
+  v_lines    text[];
+  v_scan     boolean;
+  v_trigger  boolean;
+  v_path_raw text;
+  v_path     text[];
+  v_lookup   text[];
+  v_public_w text[];
+  v_skipped  text[];
+  v_objs     text[];
+  v_kinds    text[];
+  v_notes    text[];
+  v_obj      text;
+  v_kind     text;
+  v_res      text;
+  v_det      text;
+  v_fix      text;
+  v_alt      text;
+  v_usage    text;
+  v_priv     text;
+  v_fixes    text[] := ARRAY[]::text[];
+  v_ok       integer := 0;
+  v_bad      integer := 0;
+  v_unk      integer := 0;
+  v_warn     integer := 0;
+  v_hfail    integer := 0;
+  v_noinh    text;
+  v_effsuper boolean;
+  v_schema_ok boolean;
+  i          integer;
+BEGIN
+  SELECT p.oid, format('%I.%I(%s)', n.nspname, p.proname, oidvectortypes(p.proargtypes)) AS sig, p.proname, p.prosecdef, p.proowner, p.proconfig,
+         p.prokind, p.prorettype, n.nspname, n.oid AS nsp_oid, n.nspowner, l.lanname,
+         o.rolname AS owner_name, o.rolcanlogin AS owner_login, o.rolinherit AS owner_inherit,
+         p.prosqlbody IS NOT NULL AS atomic, p.prosrc
+    INTO f
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    JOIN pg_language l ON l.oid = p.prolang
+    JOIN pg_roles o ON o.oid = p.proowner
+   WHERE p.oid = p_func;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'pg-access-inspector: function with oid % does not exist', p_func;
+  END IF;
+
+  function_name := f.sig;
+  SELECT rolname INTO v_caller FROM pg_roles WHERE oid = p_caller;
+  v_eff := CASE WHEN f.prosecdef THEN f.proowner ELSE p_caller END;
+  SELECT rolname, rolsuper INTO v_effname, v_effsuper FROM pg_roles WHERE oid = v_eff;
+  v_trigger := f.prorettype IN ('trigger'::regtype, 'event_trigger'::regtype);
+  v_scan := f.lanname IN ('plpgsql', 'sql');
+  v_src := CASE WHEN f.atomic THEN pg_get_function_sqlbody(f.oid) ELSE f.prosrc END;
+  v_lines := string_to_array(COALESCE(v_src, ''), E'\n');
+
+  -- pinned search_path
+  SELECT substr(x, 13) INTO v_path_raw FROM unnest(f.proconfig) AS x WHERE x LIKE 'search_path=%';
+  IF v_path_raw IS NOT NULL THEN
+    SELECT array_agg(CASE WHEN s IN ('$user', '"$user"') THEN v_effname
+                          WHEN s ~ '^".*"$' THEN replace(substr(s, 2, length(s) - 2), '""', '"')
+                          ELSE lower(s) END ORDER BY ord)
+      INTO v_path
+      FROM unnest(string_to_array(v_path_raw, ',')) WITH ORDINALITY AS u(s0, ord),
+           LATERAL (SELECT btrim(u.s0) AS s) b
+     WHERE b.s <> '';
+    v_path := COALESCE(v_path, ARRAY[]::text[]);
+    v_lookup := CASE WHEN 'pg_catalog' = ANY (v_path) THEN v_path ELSE ARRAY['pg_catalog'] || v_path END;
+    SELECT array_agg(n.nspname::text ORDER BY array_position(v_path, n.nspname::text)) INTO v_public_w
+      FROM pg_namespace n
+     WHERE n.nspname = ANY (v_path) AND n.nspname <> 'pg_catalog'
+       AND EXISTS (SELECT 1 FROM aclexplode(n.nspacl) a WHERE a.grantee = 0 AND a.privilege_type = 'CREATE');
+  END IF;
+
+  -- 1. who runs the body
+  v_n := v_n + 1; step := v_n; check_name := 'runs as'; line := NULL; object := v_effname; action := NULL;
+  result := 'INFO'; suggested_fix := NULL; source_line := NULL;
+  detail := CASE WHEN f.prosecdef
+                 THEN format('SECURITY DEFINER: every statement inside runs as the owner %s, so the owner''s privileges count; the caller''s (%s) do not',
+                             f.owner_name, v_caller)
+                 ELSE format('SECURITY INVOKER: statements inside run as the caller %s, so the caller''s privileges count',
+                             v_caller) END
+            || CASE WHEN v_effsuper THEN format(' (%s is a superuser: every check passes)', v_effname) ELSE '' END;
+  RETURN NEXT;
+
+  -- 2. owner
+  v_n := v_n + 1; step := v_n; check_name := 'owner'; object := f.owner_name; result := 'INFO';
+  detail := format('%s, %s', f.owner_name,
+                   CASE WHEN f.owner_login THEN 'LOGIN'
+                        WHEN f.prosecdef THEN 'NOLOGIN (fine: a SECURITY DEFINER function runs as its owner without the owner ever logging in)'
+                        ELSE 'NOLOGIN (fine: owning a function needs no login)' END)
+            || CASE WHEN f.prosecdef AND NOT f.owner_inherit THEN '; owner is NOINHERIT' ELSE '' END;
+  RETURN NEXT;
+
+  -- 3. the function's schema
+  v_schema_ok := has_schema_privilege(f.proowner, f.nsp_oid, 'USAGE');
+  v_n := v_n + 1; step := v_n; check_name := 'function schema'; object := quote_ident(f.nspname);
+  detail := format('function lives in schema %I, owned by %s', f.nspname, pg_get_userbyid(f.nspowner));
+  IF v_schema_ok THEN
+    result := 'PASS'; detail := detail || format('; owner %s has USAGE on it', f.owner_name);
+  ELSE
+    result := CASE WHEN f.prosecdef THEN 'FAIL' ELSE 'WARN' END;
+    detail := detail || format('; owner %s has NO USAGE on its own schema %I', f.owner_name, f.nspname)
+              || CASE WHEN f.prosecdef
+                      THEN format(': any statement in the body that names %I.<object> fails with "permission denied for schema %s"',
+                                  f.nspname, f.nspname)
+                      ELSE ' (matters only if the function is made SECURITY DEFINER)' END;
+    suggested_fix := format('GRANT USAGE ON SCHEMA %I TO %I;', f.nspname, f.owner_name);
+    IF f.prosecdef THEN v_fixes := v_fixes || suggested_fix; v_hfail := v_hfail + 1; END IF;
+  END IF;
+  RETURN NEXT;
+  suggested_fix := NULL;
+
+  -- 4. search_path
+  v_n := v_n + 1; step := v_n; check_name := 'search_path'; object := NULL;
+  IF v_path_raw IS NULL THEN
+    object := NULL;
+    IF f.prosecdef THEN
+      result := 'WARN';
+      detail := 'security: SECURITY DEFINER without a pinned search_path. Unqualified names resolve through the CALLER''s search_path '
+                || '(and pg_temp is searched first), so a caller can put its own table or function in the way and run code as the owner';
+      suggested_fix := format('ALTER FUNCTION %s SET search_path = pg_catalog, %I, pg_temp;', f.sig, f.nspname);
+    ELSE
+      result := 'INFO';
+      detail := 'not pinned: unqualified names resolve through the session search_path at run time';
+    END IF;
+  ELSE
+    object := v_path_raw;
+    result := 'PASS';
+    detail := format('pinned (proconfig): search_path = %s', v_path_raw);
+    IF f.prosecdef AND v_public_w IS NOT NULL THEN
+      result := 'WARN';
+      detail := detail || format('; security: schema %s is writable by PUBLIC, so any role can create objects that this SECURITY DEFINER function may pick up',
+                                 array_to_string(v_public_w, ', '));
+      suggested_fix := format('ALTER FUNCTION %s SET search_path = pg_catalog, %I, pg_temp;', f.sig, f.nspname);
+    ELSIF f.prosecdef AND (NOT ('pg_temp' = ANY (v_path)) OR v_path[array_length(v_path, 1)] <> 'pg_temp') THEN
+      result := 'WARN';
+      detail := detail || '; security: pg_temp is not listed last, so it is searched '
+                || CASE WHEN 'pg_temp' = ANY (v_path) THEN 'before later schemas' ELSE 'FIRST for tables' END
+                || ' and a caller''s temporary table can shadow a real one';
+      suggested_fix := format('ALTER FUNCTION %s SET search_path = %s, pg_temp;', f.sig,
+                              array_to_string(array_remove(v_path, 'pg_temp'), ', '));
+    END IF;
+  END IF;
+  IF suggested_fix IS NOT NULL THEN v_fixes := v_fixes || suggested_fix; END IF;
+  IF result = 'WARN' THEN v_warn := v_warn + 1; END IF;
+  RETURN NEXT;
+  suggested_fix := NULL;
+
+  -- 5. language
+  v_n := v_n + 1; step := v_n; check_name := 'language'; object := f.lanname; result := 'INFO';
+  detail := CASE WHEN v_scan THEN format('%s: body scanned for the objects it names (best effort, not a full parser)', f.lanname)
+                 ELSE format('%s: the body is not scanned; only the header checks above apply', f.lanname) END;
+  RETURN NEXT;
+
+  -- 6. calling it
+  v_n := v_n + 1; step := v_n; object := f.sig; line := NULL;
+  IF v_trigger THEN
+    check_name := 'caller EXECUTE'; action := NULL; result := 'INFO';
+    detail := 'trigger function: EXECUTE is checked only when the trigger is created, not each time it fires';
+    suggested_fix := NULL;
+  ELSE
+    check_name := 'caller EXECUTE'; action := 'EXECUTE';
+    SELECT w.result, w.detail, w.suggested_fix INTO y
+      FROM public.access_why(v_caller, f.sig, 'EXECUTE', 'routine') w WHERE w.step = 0 LIMIT 1;
+    result := y.result; detail := format('%s calling %s: %s', v_caller, f.sig, y.detail);
+    suggested_fix := y.suggested_fix;
+    IF suggested_fix IS NOT NULL AND y.result NOT LIKE 'YES%' THEN v_fixes := v_fixes || suggested_fix; END IF;
+  END IF;
+  RETURN NEXT;
+  action := NULL; suggested_fix := NULL;
+
+  -- 7. NOINHERIT memberships of the owner (SECURITY DEFINER only)
+  IF f.prosecdef THEN
+    SELECT string_agg(DISTINCT x.role_name, ', ') INTO v_noinh
+      FROM public.access__reach(f.proowner) x
+     WHERE x.depth > 0 AND NOT x.inherits;
+    IF v_noinh IS NOT NULL THEN
+      v_n := v_n + 1; step := v_n; check_name := 'owner NOINHERIT'; object := f.owner_name; result := 'WARN';
+      v_warn := v_warn + 1;
+      detail := format('owner %s reaches %s only through NOINHERIT memberships. SET ROLE is not allowed inside a SECURITY DEFINER function, '
+                       || 'so privileges held only by those roles never count here', f.owner_name, v_noinh);
+      RETURN NEXT;
+    END IF;
+  END IF;
+
+  -- 8. references in the body
+  IF v_scan THEN
+    FOR r IN SELECT * FROM public.access__body_refs(v_src, f.lanname) ORDER BY 1, 2 LOOP
+      line := r.line; action := r.action;
+      source_line := btrim(v_lines[r.line]);
+      v_objs := ARRAY[]::text[]; v_kinds := ARRAY[]::text[]; v_notes := ARRAY[]::text[];
+      v_det := NULL; v_res := NULL; v_fix := NULL;
+
+      IF r.ref_type = 'dynamic' THEN
+        v_res := 'CANNOT VERIFY';
+        v_det := r.note || format('; whatever it touches is checked against %s at run time', v_effname);
+      ELSE
+        -- resolve the name
+        IF array_length(r.parts, 1) = 3 THEN
+          IF r.parts[1] = current_database() THEN r.parts := r.parts[2:3];
+          ELSE v_res := 'CANNOT VERIFY'; v_det := format('%s names another database', r.written); END IF;
+        END IF;
+        IF v_res IS NULL AND array_length(r.parts, 1) = 2 THEN
+          SELECT array_agg(x.obj ORDER BY x.obj), array_agg(x.kind ORDER BY x.obj) INTO v_objs, v_kinds
+            FROM public.access__find(r.ref_type, r.parts[1], r.parts[2]) x;
+          IF v_objs IS NULL THEN
+            v_res := 'CANNOT VERIFY';
+            v_det := CASE WHEN NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = r.parts[1])
+                          THEN format('schema %I does not exist in database %s', r.parts[1], current_database())
+                          ELSE format('%s not found: created at run time, renamed, or not a %s', r.written, r.ref_type) END;
+          END IF;
+        ELSIF v_res IS NULL AND v_lookup IS NOT NULL THEN
+          -- unqualified, pinned search_path: first schema that has it and that the role can use
+          v_skipped := ARRAY[]::text[];
+          v_objs := NULL;
+          FOREACH v_obj IN ARRAY v_lookup LOOP
+            CONTINUE WHEN v_obj = 'pg_temp';
+            CONTINUE WHEN NOT EXISTS (SELECT 1 FROM public.access__find(r.ref_type, v_obj, r.parts[1]));
+            IF NOT v_effsuper AND NOT has_schema_privilege(v_eff, (SELECT oid FROM pg_namespace WHERE nspname = v_obj), 'USAGE') THEN
+              v_skipped := v_skipped || v_obj;
+              CONTINUE;
+            END IF;
+            SELECT array_agg(x.obj ORDER BY x.obj), array_agg(x.kind ORDER BY x.obj) INTO v_objs, v_kinds
+              FROM public.access__find(r.ref_type, v_obj, r.parts[1]) x;
+            v_notes := v_notes || format('unqualified %s resolved through the pinned search_path to schema %I', r.written, v_obj);
+            EXIT;
+          END LOOP;
+          IF v_objs IS NOT NULL AND array_length(v_skipped, 1) > 0 THEN
+            v_notes := v_notes || format('schema %s skipped: %s has no USAGE there', array_to_string(v_skipped, ', '), v_effname);
+          ELSIF v_objs IS NULL AND array_length(v_skipped, 1) > 0 THEN
+            v_res := 'NO';
+            v_det := format('%s exists only in schema %s, but %s has no USAGE there, so the search_path lookup skips it and the statement fails with "%s %s does not exist"',
+                            r.written, array_to_string(v_skipped, ', '), v_effname,
+                            CASE WHEN r.ref_type = 'function' THEN 'function' ELSE 'relation' END, r.parts[1]);
+            v_fix := format('GRANT USAGE ON SCHEMA %I TO %I;', v_skipped[1], v_effname);
+          ELSIF v_objs IS NULL THEN
+            v_res := 'CANNOT VERIFY';
+            v_det := format('%s not found in the pinned search_path (%s): a temporary table, a CTE, or created at run time',
+                            r.written, v_path_raw);
+          END IF;
+        ELSIF v_res IS NULL THEN
+          -- unqualified, no pinned search_path: it depends on the session
+          SELECT array_agg(x.obj ORDER BY x.obj), array_agg(x.kind ORDER BY x.obj),
+                 count(DISTINCT split_part(x.obj, '.', 1))
+            INTO v_objs, v_kinds, i
+            FROM public.access__find(r.ref_type, NULL, r.parts[1]) x;
+          IF i = 1 THEN
+            v_notes := v_notes || format('unqualified %s: assumed to be %s, the only match; the real one depends on the session search_path at run time',
+                                         r.written, v_objs[1]);
+          ELSE
+            v_res := 'CANNOT VERIFY';
+            v_det := CASE WHEN COALESCE(i, 0) = 0
+                          THEN format('unqualified %s not found in any schema: a temporary table, a CTE, a variable, or created at run time', r.written)
+                          ELSE format('unqualified %s matches %s; which one runs depends on the session search_path (pin it with ALTER FUNCTION ... SET search_path)',
+                                      r.written, array_to_string(v_objs, ', ')) END;
+          END IF;
+        END IF;
+      END IF;
+
+      IF v_res IS NOT NULL THEN
+        object := r.written; check_name := CASE WHEN r.ref_type = 'dynamic' THEN 'dynamic SQL' ELSE 'reference' END;
+        result := v_res; detail := v_det; suggested_fix := v_fix;
+        IF v_res = 'CANNOT VERIFY' THEN v_unk := v_unk + 1; ELSE v_bad := v_bad + 1; END IF;
+        IF v_fix IS NOT NULL THEN v_fixes := v_fixes || v_fix; END IF;
+        v_n := v_n + 1; step := v_n; RETURN NEXT;
+        CONTINUE;
+      END IF;
+
+      -- check every resolved object (plus sequences behind column defaults for INSERT)
+      FOR c IN
+        SELECT u.obj, u.kind, u.act, u.why, u.ord
+          FROM unnest(v_objs, v_kinds) WITH ORDINALITY AS u0(obj, kind, ord)
+          CROSS JOIN LATERAL (
+            SELECT u0.obj, u0.kind, r.action AS act, NULL::text AS why, u0.ord
+            UNION ALL
+            SELECT format('%I.%I', sn.nspname, s.relname), 'relation', 'USAGE',
+                   format('column %I of %s defaults to nextval(); needed unless the INSERT supplies that column', a.attname, u0.obj),
+                   u0.ord
+              FROM pg_class t
+              JOIN pg_namespace tn ON tn.oid = t.relnamespace
+              JOIN pg_attrdef ad ON ad.adrelid = t.oid
+              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ad.adnum
+              JOIN pg_depend d ON d.classid = 'pg_attrdef'::regclass AND d.objid = ad.oid
+                              AND d.refclassid = 'pg_class'::regclass
+              JOIN pg_class s ON s.oid = d.refobjid AND s.relkind = 'S'
+              JOIN pg_namespace sn ON sn.oid = s.relnamespace
+             WHERE r.action = 'INSERT' AND u0.kind = 'relation' AND format('%I.%I', tn.nspname, t.relname) = u0.obj
+          ) u
+         ORDER BY u.ord, u.why NULLS FIRST
+      LOOP
+        -- access_why, minus database CONNECT: the session is already connected
+        SELECT max(w.result) FILTER (WHERE w.check_name = 'schema USAGE') AS usage,
+               max(w.suggested_fix) FILTER (WHERE w.check_name = 'schema USAGE') AS usage_fix,
+               max(w.result) FILTER (WHERE w.check_name LIKE '% privilege') AS priv,
+               max(w.detail) FILTER (WHERE w.check_name LIKE '% privilege') AS priv_det,
+               max(w.suggested_fix) FILTER (WHERE w.check_name LIKE '% privilege') AS priv_fix,
+               max(w.suggested_fix) FILTER (WHERE w.check_name = 'column grants') AS cols_fix,
+               max(w.result) FILTER (WHERE w.check_name = 'row level security') AS rls,
+               max(w.detail) FILTER (WHERE w.check_name = 'row level security') AS rls_det,
+               max(w.suggested_fix) FILTER (WHERE w.check_name = 'row level security') AS rls_fix,
+               max(substring(w.suggested_fix FROM '-- or inherit it: (.*)$')) AS alt,
+               max(w.detail) FILTER (WHERE w.check_name = 'schema USAGE') AS usage_det,
+               max(w.result) FILTER (WHERE w.step = 0) AS answer
+          INTO y
+          FROM public.access_why(v_effname, c.obj, c.act,
+                                 CASE WHEN c.kind = 'relation' THEN NULL ELSE 'routine' END) w;
+        -- y: usage, usage_fix, priv, priv_det, priv_fix, cols_fix, rls, rls_det, rls_fix, alt, usage_det, answer
+        v_usage := y.usage; v_priv := y.priv; v_alt := y.alt;
+        object := c.obj; action := c.act; check_name := 'reference';
+        IF y.answer = 'ERROR' THEN
+          v_res := 'CANNOT VERIFY'; v_det := format('%s is not a valid privilege check here', c.act); v_fix := NULL;
+        ELSIF v_effsuper OR (v_priv = 'PASS' AND COALESCE(v_usage, 'PASS') = 'PASS') THEN
+          v_res := CASE WHEN v_effsuper THEN 'YES'
+                        WHEN y.rls = 'FAIL' THEN 'YES, BUT RLS BLOCKS ALL ROWS'
+                        WHEN y.rls = 'WARN' THEN 'YES, RLS FILTERS ROWS' ELSE 'YES' END;
+          v_det := CASE WHEN v_effsuper THEN 'superuser' ELSE y.priv_det END
+                   || CASE WHEN y.rls IN ('FAIL', 'WARN') THEN '; ' || y.rls_det ELSE '' END;
+          v_fix := CASE WHEN y.rls = 'FAIL' THEN y.rls_fix END;
+        ELSIF v_priv IN ('PASS', 'WARN') AND COALESCE(v_usage, 'PASS') IN ('PASS', 'WARN') THEN
+          -- reachable only after SET ROLE (NOINHERIT membership somewhere)
+          IF f.prosecdef THEN
+            v_res := 'NO (NOINHERIT)';
+            v_det := concat_ws('; ', CASE WHEN v_usage = 'WARN' THEN y.usage_det END,
+                                     CASE WHEN v_priv = 'WARN' THEN y.priv_det END)
+                     || '. SET ROLE is not allowed inside a SECURITY DEFINER function, so this fails here';
+            v_fix := concat_ws(E'\n',
+                       CASE WHEN v_usage = 'WARN' THEN
+                         (SELECT format('GRANT USAGE ON SCHEMA %I TO %I;', x.schema_name, v_effname)
+                            FROM public.access__objects(c.obj, CASE WHEN c.kind = 'relation' THEN NULL ELSE 'routine' END) x LIMIT 1) END,
+                       CASE WHEN v_priv = 'WARN' THEN
+                         (SELECT format('GRANT %s ON %s %s TO %I;', c.act, public.access__keyword(x.kind), x.display, v_effname)
+                            FROM public.access__objects(c.obj, CASE WHEN c.kind = 'relation' THEN NULL ELSE 'routine' END) x LIMIT 1) END,
+                       '-- or let the owner inherit it: ' || v_alt);
+          ELSE
+            v_res := 'ONLY AFTER SET ROLE';
+            v_det := concat_ws('; ', CASE WHEN v_usage = 'WARN' THEN y.usage_det END,
+                                     CASE WHEN v_priv = 'WARN' THEN y.priv_det END);
+            v_fix := concat_ws(E'\n', CASE WHEN v_usage = 'WARN' THEN y.usage_fix END,
+                                      CASE WHEN v_priv = 'WARN' THEN y.priv_fix END);
+          END IF;
+        ELSIF y.cols_fix IS NOT NULL AND COALESCE(v_usage, 'PASS') = 'PASS' THEN
+          v_res := 'COLUMNS ONLY';
+          v_det := 'only some columns are granted; works if the statement uses only those';
+          v_fix := y.cols_fix;
+        ELSE
+          v_res := 'NO';
+          v_det := 'missing: ' || concat_ws(', ',
+                     CASE WHEN v_usage IS DISTINCT FROM 'PASS' AND v_usage IS NOT NULL THEN
+                       format('USAGE on schema %I', (SELECT x.schema_name FROM public.access__objects(c.obj,
+                               CASE WHEN c.kind = 'relation' THEN NULL ELSE 'routine' END) x LIMIT 1)) END,
+                     CASE WHEN v_priv IS DISTINCT FROM 'PASS' THEN format('%s on %s', c.act, c.obj) END)
+                   || CASE WHEN v_priv = 'PASS' THEN format(' (%s itself is %s)', c.act, y.priv_det) ELSE '' END;
+          v_fix := concat_ws(E'\n', CASE WHEN v_usage IS DISTINCT FROM 'PASS' THEN y.usage_fix END,
+                                    CASE WHEN v_priv IS DISTINCT FROM 'PASS' THEN y.priv_fix END);
+        END IF;
+        v_fix := NULLIF(v_fix, '');
+        detail := format('%s %s as %s: %s', c.act, c.obj, v_effname, v_det)
+                  || CASE WHEN v_usage IS NOT NULL THEN format(' [schema USAGE: %s]', v_usage) ELSE '' END
+                  || COALESCE('; ' || NULLIF(array_to_string(v_notes || c.why, '; '), ''), '');
+        result := v_res;
+        suggested_fix := v_fix;
+        IF v_res = 'YES' OR v_res LIKE 'YES,%' THEN v_ok := v_ok + 1; ELSE v_bad := v_bad + 1; END IF;
+        IF suggested_fix IS NOT NULL AND NOT (suggested_fix = ANY (v_fixes)) THEN v_fixes := v_fixes || suggested_fix; END IF;
+        v_n := v_n + 1; step := v_n; RETURN NEXT;
+      END LOOP;
+    END LOOP;
+  END IF;
+
+  -- 9. summary
+  line := NULL; action := NULL; source_line := NULL;
+  v_n := v_n + 1; step := v_n; check_name := 'summary'; object := v_effname;
+  result := CASE WHEN v_bad + v_hfail > 0 THEN 'FAIL' WHEN v_unk > 0 THEN 'CANNOT VERIFY' WHEN v_warn > 0 THEN 'WARN'
+                 WHEN NOT v_scan THEN 'INFO' ELSE 'PASS' END;
+  detail := CASE WHEN NOT v_scan THEN format('body not scanned (%s); privileges inside count for %s', f.lanname, v_effname)
+                 ELSE format('checked as %s (%s): %s reference(s) OK, %s missing, %s cannot be verified',
+                             v_effname, CASE WHEN f.prosecdef THEN 'owner, SECURITY DEFINER' ELSE 'caller, SECURITY INVOKER' END,
+                             v_ok, v_bad, v_unk) END;
+  -- one line per fix, first occurrence kept
+  SELECT string_agg(u.l, E'\n' ORDER BY u.l LIKE '--%', u.first)
+    INTO suggested_fix
+    FROM (SELECT x.l, min(x.ord) AS first
+            FROM unnest(string_to_array(array_to_string(v_fixes, E'\n'), E'\n')) WITH ORDINALITY AS x(l, ord)
+           WHERE btrim(x.l) <> ''
+           GROUP BY x.l) u;
+  RETURN NEXT;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION public.access_function_check(p_function text, p_caller_role text DEFAULT current_user)
+RETURNS TABLE(function_name text, step integer, check_name text, line integer, object text, action text,
+              result text, detail text, suggested_fix text, source_line text)
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+  v_caller oid := public.access__role(p_caller_role);
+  v_found  boolean := false;
+  o        record;
+BEGIN
+  FOR o IN SELECT x.obj_oid FROM public.access__objects(p_function, 'routine') x ORDER BY x.display LOOP
+    v_found := true;
+    RETURN QUERY SELECT * FROM public.access__function_check(o.obj_oid, v_caller);
+  END LOOP;
+  IF NOT v_found THEN
+    RAISE EXCEPTION 'pg-access-inspector: no function named % in database %', p_function, current_database()
+      USING HINT = 'Schema-qualify the name, and add the argument types for overloaded functions: myschema.fn(integer)';
+  END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION public.access_function_check(p_function regprocedure, p_caller_role text DEFAULT current_user)
+RETURNS TABLE(function_name text, step integer, check_name text, line integer, object text, action text,
+              result text, detail text, suggested_fix text, source_line text)
+LANGUAGE sql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+  SELECT * FROM public.access__function_check(p_function::oid, public.access__role(p_caller_role))
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- 2c. access_trigger_check(table [, caller_role]): every trigger on a table,
+--     and whether each trigger function can do its work as the role it runs as
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.access_trigger_check(p_table text, p_caller_role text DEFAULT current_user)
+RETURNS TABLE(trigger_name text, timing text, events text, enabled text, function_name text,
+              step integer, check_name text, line integer, object text, action text,
+              result text, detail text, suggested_fix text, source_line text)
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  v_caller oid := public.access__role(p_caller_role);
+  v_cname  text;
+  o        record;
+  t        record;
+  y        record;
+  v_found  boolean := false;
+  v_n      integer;
+  v_ev     text;
+BEGIN
+  SELECT rolname INTO v_cname FROM pg_roles WHERE oid = v_caller;
+  FOR o IN SELECT * FROM public.access__objects(p_table, 'relation') x
+            WHERE x.kind IN ('table', 'partitioned table', 'view', 'foreign table') LOOP
+    v_found := true; v_n := 0;
+
+    -- the caller's own privilege for each event an enabled trigger fires on
+    FOR v_ev IN
+      SELECT DISTINCT e.ev
+        FROM pg_trigger tg
+        CROSS JOIN LATERAL (VALUES (4, 'INSERT'), (8, 'DELETE'), (16, 'UPDATE'), (32, 'TRUNCATE')) AS e(bit, ev)
+       WHERE tg.tgrelid = o.obj_oid AND NOT tg.tgisinternal AND tg.tgenabled <> 'D'
+         AND (tg.tgtype::integer & e.bit) <> 0
+       ORDER BY 1
+    LOOP
+      SELECT w.result, w.detail, w.suggested_fix INTO y
+        FROM public.access_why(v_cname, o.display, v_ev) w WHERE w.step = 0 LIMIT 1;
+      trigger_name := NULL; timing := NULL; events := v_ev; enabled := NULL; function_name := NULL;
+      v_n := v_n + 1; step := v_n; check_name := 'caller privilege'; line := NULL;
+      object := o.display; action := v_ev; result := y.result;
+      detail := format('%s running %s on %s (needed before any trigger fires): %s', v_cname, v_ev, o.display, y.detail);
+      suggested_fix := CASE WHEN y.result LIKE 'YES%' THEN NULL ELSE y.suggested_fix END;
+      source_line := NULL;
+      RETURN NEXT;
+    END LOOP;
+
+    FOR t IN
+      SELECT tg.tgname::text AS name, tg.tgfoid, tg.tgenabled,
+             CASE WHEN tg.tgtype::integer & 2 <> 0 THEN 'BEFORE'
+                  WHEN tg.tgtype::integer & 64 <> 0 THEN 'INSTEAD OF' ELSE 'AFTER' END
+             || CASE WHEN tg.tgtype::integer & 1 <> 0 THEN ' ROW' ELSE ' STATEMENT' END AS timing,
+             concat_ws(' OR ',
+               CASE WHEN tg.tgtype::integer & 4 <> 0 THEN 'INSERT' END,
+               CASE WHEN tg.tgtype::integer & 16 <> 0 THEN 'UPDATE' END,
+               CASE WHEN tg.tgtype::integer & 8 <> 0 THEN 'DELETE' END,
+               CASE WHEN tg.tgtype::integer & 32 <> 0 THEN 'TRUNCATE' END) AS events,
+             p.oid::regprocedure::text AS func, p.prosecdef, pg_get_userbyid(p.proowner) AS owner
+        FROM pg_trigger tg
+        JOIN pg_proc p ON p.oid = tg.tgfoid
+       WHERE tg.tgrelid = o.obj_oid AND NOT tg.tgisinternal
+       ORDER BY tg.tgname
+    LOOP
+      trigger_name := t.name; timing := t.timing; events := t.events; function_name := t.func;
+      enabled := CASE t.tgenabled WHEN 'O' THEN 'enabled' WHEN 'D' THEN 'disabled'
+                                  WHEN 'R' THEN 'replica only' WHEN 'A' THEN 'always' END;
+      v_n := v_n + 1; step := v_n; check_name := 'trigger'; line := NULL; object := o.display; action := NULL;
+      result := 'INFO';
+      detail := format('%s %s on %s runs %s as %s', t.timing, t.events, o.display, t.func,
+                       CASE WHEN t.prosecdef THEN format('the function owner %s (SECURITY DEFINER)', t.owner)
+                            ELSE format('the role running the statement, %s (SECURITY INVOKER)', v_cname) END)
+                || CASE t.tgenabled WHEN 'D' THEN '; DISABLED: it does not fire'
+                                    WHEN 'R' THEN '; fires only when session_replication_role = replica'
+                                    ELSE '' END;
+      suggested_fix := NULL; source_line := NULL;
+      RETURN NEXT;
+      FOR y IN SELECT * FROM public.access__function_check(t.tgfoid, v_caller) fc
+                WHERE fc.check_name NOT IN ('caller EXECUTE', 'language') LOOP
+        v_n := v_n + 1; step := v_n;
+        check_name := y.check_name; line := y.line; object := y.object; action := y.action;
+        result := y.result; detail := y.detail; suggested_fix := y.suggested_fix; source_line := y.source_line;
+        RETURN NEXT;
+      END LOOP;
+    END LOOP;
+
+    IF v_n = 0 THEN
+      trigger_name := NULL; timing := NULL; events := NULL; enabled := NULL; function_name := NULL;
+      step := 1; check_name := 'trigger'; line := NULL; object := o.display; action := NULL; result := 'INFO';
+      detail := format('%s has no user-defined triggers', o.display); suggested_fix := NULL; source_line := NULL;
+      RETURN NEXT;
+    END IF;
+  END LOOP;
+  IF NOT v_found THEN
+    RAISE EXCEPTION 'pg-access-inspector: no table or view named % in database %', p_table, current_database();
+  END IF;
+END
+$fn$;
+
+-- ---------------------------------------------------------------------------
 -- 3. access_privileges(role [, include_public]): everything the role can use
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.access_privileges(p_role text, p_include_public boolean DEFAULT true)
@@ -1148,6 +2058,7 @@ $fn$;
 
 -- ---------------------------------------------------------------------------
 -- 7. access_explain_error(error_text [, role [, action]])
+--    CONTEXT / Where: lines decide whose privilege counts (caller or function owner)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.access_explain_error(p_error text, p_role text DEFAULT current_user,
                                                        p_action text DEFAULT NULL)
@@ -1182,6 +2093,27 @@ DECLARE
   v_ambig   boolean;
   v_held    text;
   v_missing text[];
+  v_caller  oid;
+  v_k       integer;
+  v_oids    oid[];
+  v_ctx_oid oid[];
+  v_ctx_label text[];
+  v_ctx_line integer[];
+  v_ctx_stmt integer[];
+  v_ctx_ambig integer[];
+  v_def_k   integer;
+  v_body    text;
+  v_blines  text[];
+  v_fsig    text;
+  v_lang    text;
+  v_from    integer;
+  v_to      integer;
+  v_ctx_text text;
+  v_ctx_obj text;
+  v_cname   text;
+  v_stmt_src text;
+  v_ctx_fixes text[] := ARRAY[]::text[];
+  r         record;
 BEGIN
   SELECT quote_ident(rolname) INTO v_rname FROM pg_roles WHERE oid = v_role;
   v_stmt := substring(v_txt FROM '(?i)STATEMENT: ?(.*)$');
@@ -1225,14 +2157,147 @@ BEGIN
               WHEN 'function' THEN 'function' WHEN 'procedure' THEN 'function' WHEN 'routine' THEN 'function'
               WHEN 'aggregate' THEN 'function'
               ELSE v_word END;
+  -- CONTEXT / Where: lines name the function(s) the statement ran in, innermost first
+  v_caller := v_role;
+  FOR m IN SELECT regexp_matches(v_txt,
+             'PL/pgSQL function ((?:"(?:[^"]|"")+"|[^ "(])+)\(([^)]*)\) line ([0-9]+)'
+             || '|SQL function "((?:[^"]|"")+)" statement ([0-9]+)', 'g')
+  LOOP
+    v_k := COALESCE(array_length(v_ctx_oid, 1), 0) + 1;
+    IF m[1] IS NOT NULL THEN
+      SELECT array_agg(x.obj_oid) INTO v_oids
+        FROM public.access__objects(m[1] || '(' || m[2] || ')', 'routine') x;
+      v_ctx_label := v_ctx_label || (m[1] || '(' || m[2] || ')');
+      v_ctx_line := v_ctx_line || m[3]::integer;
+      v_ctx_stmt := v_ctx_stmt || NULL::integer;
+    ELSE
+      SELECT array_agg(p.oid) INTO v_oids
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_language l ON l.oid = p.prolang
+       WHERE p.proname = replace(m[4], '""', '"') AND l.lanname = 'sql'
+         AND NOT public.access__is_system_schema(n.nspname);
+      v_ctx_label := v_ctx_label || ('"' || m[4] || '"');
+      v_ctx_line := v_ctx_line || NULL::integer;
+      v_ctx_stmt := v_ctx_stmt || m[5]::integer;
+    END IF;
+    v_ctx_oid := v_ctx_oid || CASE WHEN array_length(v_oids, 1) = 1 THEN v_oids[1] ELSE 0::oid END;
+    v_ctx_ambig := v_ctx_ambig || COALESCE(array_length(v_oids, 1), 0);
+  END LOOP;
+  IF v_ctx_oid IS NOT NULL THEN
+    -- privileges are checked as current_user: the owner of the innermost SECURITY DEFINER frame, else the caller
+    FOR v_k IN 1 .. array_length(v_ctx_oid, 1) LOOP
+      IF v_ctx_oid[v_k] <> 0 AND (SELECT p.prosecdef FROM pg_proc p WHERE p.oid = v_ctx_oid[v_k]) THEN
+        v_def_k := v_k;
+        SELECT p.proowner INTO v_role FROM pg_proc p WHERE p.oid = v_ctx_oid[v_k];
+        EXIT;
+      END IF;
+    END LOOP;
+    SELECT quote_ident(rolname) INTO v_rname FROM pg_roles WHERE oid = v_role;
+    IF v_ctx_oid[1] <> 0 THEN
+      SELECT CASE WHEN p.prosqlbody IS NOT NULL THEN pg_get_function_sqlbody(p.oid) ELSE p.prosrc END,
+             format('%I.%I(%s)', n.nspname, p.proname, oidvectortypes(p.proargtypes)), l.lanname
+        INTO v_body, v_fsig, v_lang
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_language l ON l.oid = p.prolang
+       WHERE p.oid = v_ctx_oid[1];
+      v_blines := string_to_array(v_body, E'\n');
+      IF v_ctx_line[1] IS NOT NULL THEN
+        v_from := v_ctx_line[1];
+        -- the statement runs to the next top-level ';'
+        SELECT min(t.line) INTO v_to FROM public.access__tokens(v_body) t
+         WHERE t.kind = 'p' AND t.tok = ';' AND t.line >= v_from;
+      ELSE
+        SELECT min(t.line), max(t.line) INTO v_from, v_to FROM public.access__tokens(v_body) t
+         WHERE t.stmt = v_ctx_stmt[1];
+      END IF;
+      v_to := least(COALESCE(v_to, v_from), v_from + 9);
+      IF v_from IS NOT NULL AND v_from <= COALESCE(array_length(v_blines, 1), 0) THEN
+        SELECT string_agg(format('%s: %s', x.ln, rtrim(v_blines[x.ln])), E'\n' ORDER BY x.ln)
+          INTO v_ctx_text
+          FROM generate_series(v_from, least(v_to, array_length(v_blines, 1))) AS x(ln);
+        IF v_stmt IS NULL THEN
+          SELECT string_agg(btrim(v_blines[x.ln]), ' ' ORDER BY x.ln) INTO v_stmt
+            FROM generate_series(v_from, least(v_to, array_length(v_blines, 1))) AS x(ln);
+          v_kw := upper(substring(COALESCE(v_stmt, '') FROM '^[ (]*([A-Za-z]+)'));
+          v_stmt_src := 'taken from the function body, ' || COALESCE('line ' || v_ctx_line[1], 'statement ' || v_ctx_stmt[1]);
+        END IF;
+      END IF;
+      -- an unqualified object name in the message: take the one the statement names
+      IF v_mode IN ('privilege', 'rls') AND position('.' IN v_name) = 0 AND v_from IS NOT NULL THEN
+        SELECT fc.object INTO v_ctx_obj
+          FROM public.access__function_check(v_ctx_oid[1], v_caller) fc
+         WHERE fc.check_name = 'reference' AND fc.line BETWEEN v_from AND v_to
+           AND ((v_type = 'relation' AND fc.object ~ ('\.' || quote_ident(btrim(v_name, '"')) || '$'))
+                OR (v_type = 'function' AND fc.object ~ ('\.' || quote_ident(btrim(v_name, '"')) || '\(')))
+         LIMIT 1;
+        IF v_ctx_obj IS NOT NULL THEN
+          v_name := CASE WHEN v_type = 'function' THEN v_ctx_obj ELSE v_ctx_obj END;
+        END IF;
+      END IF;
+    END IF;
+  END IF;
 
   v_n := v_n + 1; step := v_n; finding := 'parsed';
   detail := format('%s on %s %s%s, checked for role %s',
                    CASE v_mode WHEN 'privilege' THEN 'missing privilege' WHEN 'owner' THEN 'needs ownership'
                                WHEN 'setrole' THEN 'SET ROLE refused' ELSE 'row level security rejected a row' END,
-                   COALESCE(v_word, 'role'), v_name, COALESCE(' column ' || v_col, ''), v_rname);
+                   COALESCE(v_word, 'role'), v_name, COALESCE(' column ' || v_col, ''), v_rname)
+            || CASE WHEN v_role IS DISTINCT FROM v_caller
+                    THEN format(' (owner of the SECURITY DEFINER function; the caller was %s)', (SELECT quote_ident(rolname) FROM pg_roles WHERE oid = v_caller)) ELSE '' END;
   suggested_fix := NULL;
   RETURN NEXT;
+
+  -- the function the statement ran in, and whose privileges counted there
+  IF v_ctx_oid IS NOT NULL THEN
+    SELECT rolname INTO v_cname FROM pg_roles WHERE oid = v_caller;
+    v_n := v_n + 1; step := v_n; finding := 'raised in';
+    IF v_ctx_oid[1] = 0 THEN
+      detail := format('function %s (from the CONTEXT line) %s in database %s', v_ctx_label[1],
+                       CASE WHEN v_ctx_ambig[1] > 1 THEN 'matches several functions' ELSE 'was not found' END,
+                       current_database());
+    ELSE
+      SELECT format('%s of %s (%s, %s, owner %s)',
+                    COALESCE('line ' || v_ctx_line[1], 'statement ' || v_ctx_stmt[1]), v_fsig, v_lang,
+                    CASE WHEN p.prosecdef THEN 'SECURITY DEFINER' ELSE 'SECURITY INVOKER' END,
+                    pg_get_userbyid(p.proowner))
+        INTO detail FROM pg_proc p WHERE p.oid = v_ctx_oid[1];
+    END IF;
+    IF array_length(v_ctx_oid, 1) > 1 THEN
+      detail := detail || '; called from ' || array_to_string(v_ctx_label[2:], ' ← ');
+    END IF;
+    suggested_fix := NULL;
+    RETURN NEXT;
+
+    IF v_ctx_text IS NOT NULL THEN
+      v_n := v_n + 1; step := v_n;
+      finding := 'statement at ' || COALESCE('line ' || v_ctx_line[1], 'statement ' || v_ctx_stmt[1]);
+      detail := v_ctx_text; suggested_fix := NULL;
+      RETURN NEXT;
+      FOR r IN SELECT fc.* FROM public.access__function_check(v_ctx_oid[1], v_caller) fc
+                WHERE fc.check_name IN ('reference', 'dynamic SQL') AND fc.line BETWEEN v_from AND v_to
+                ORDER BY fc.step LOOP
+        v_n := v_n + 1; step := v_n;
+        finding := format('%s at line %s: %s%s: %s', r.check_name, r.line, COALESCE(r.action || ' ', ''), r.object, r.result);
+        detail := r.detail; suggested_fix := r.suggested_fix;
+        IF r.suggested_fix IS NOT NULL THEN v_ctx_fixes := v_ctx_fixes || r.suggested_fix; END IF;
+        RETURN NEXT;
+      END LOOP;
+    END IF;
+
+    v_n := v_n + 1; step := v_n; suggested_fix := NULL;
+    IF v_def_k IS NOT NULL THEN
+      finding := 'whose privilege: OWNER ' || v_rname;
+      detail := format('%s is SECURITY DEFINER, so %s ran as its owner %s. The caller %s''s own grants do not count there: fix the owner''s privileges, not the caller''s',
+                       CASE WHEN v_def_k = 1 THEN v_fsig ELSE format('%s (which called %s)', v_ctx_label[v_def_k], v_fsig) END,
+                       COALESCE('line ' || v_ctx_line[1], 'statement ' || v_ctx_stmt[1]), v_rname, quote_ident(v_cname));
+    ELSIF v_ctx_oid[1] <> 0 THEN
+      finding := 'whose privilege: CALLER ' || v_rname;
+      detail := format('%s is SECURITY INVOKER (and no SECURITY DEFINER function is above it), so its statements run with the caller %s''s privileges: fix the caller''s privileges (or make the function SECURITY DEFINER with a pinned search_path)',
+                       v_fsig, v_rname);
+    ELSE
+      finding := 'whose privilege: CALLER ' || v_rname || ' (assumed)';
+      detail := 'the function could not be identified, so the role given was checked';
+    END IF;
+    RETURN NEXT;
+  END IF;
 
   -- SET ROLE refused: membership question, no object to resolve
   IF v_mode = 'setrole' THEN
@@ -1328,7 +2393,7 @@ BEGIN
                    ELSE ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'] END;
   END IF;
   IF v_note IS NULL THEN
-    v_note := CASE WHEN array_length(v_actions, 1) = 1 AND v_stmt IS NOT NULL THEN 'taken from the STATEMENT'
+    v_note := CASE WHEN array_length(v_actions, 1) = 1 AND v_stmt IS NOT NULL THEN COALESCE(v_stmt_src, 'taken from the STATEMENT')
                    WHEN array_length(v_actions, 1) = 1 THEN 'the only privilege for this object type'
                    ELSE NULL END;
   END IF;
@@ -1373,15 +2438,17 @@ BEGIN
   FOR w IN
     SELECT DISTINCT ON (q.check_name, q.detail) q.*
       FROM (
-        SELECT x.display, a.act, y.step AS wstep, y.check_name, y.result, y.detail, y.suggested_fix, a.ord
+        SELECT x.display, x.kind AS okind, x.schema_name AS oschema, a.act, y.step AS wstep, y.check_name, y.result, y.detail, y.suggested_fix, a.ord
           FROM public.access__objects(v_name, v_type) x
           CROSS JOIN unnest(v_lacking) WITH ORDINALITY AS a(act, ord)
-          CROSS JOIN LATERAL public.access_why(p_role, x.display, a.act, x.kind) y
+          CROSS JOIN LATERAL public.access_why((SELECT rolname FROM pg_roles WHERE oid = v_role), x.display, a.act, x.kind) y
          WHERE a.act = ANY (public.access__valid_privs(x.kind))
            AND y.check_name <> 'answer'
            AND (y.result IN ('FAIL', 'WARN', 'ERROR') OR (v_mode = 'rls' AND y.check_name = 'row level security'))
            -- RLS never raises "permission denied"; it matters only for RLS errors
            AND (y.check_name <> 'row level security' OR v_mode = 'rls')
+           -- inside a function the session is already connected
+           AND NOT (v_ctx_oid IS NOT NULL AND y.check_name = 'database CONNECT')
            -- for an ambiguous action, one combined GRANT line replaces the per-action ones
            AND NOT (v_ambig AND y.check_name LIKE '% privilege' AND y.result = 'FAIL')
       ) q
@@ -1393,8 +2460,16 @@ BEGIN
                || ': ' || w.result;
     detail := w.detail;
     suggested_fix := w.suggested_fix;
-    IF w.suggested_fix IS NOT NULL AND NOT (w.suggested_fix = ANY (v_fixes)) THEN
-      v_fixes := v_fixes || w.suggested_fix;
+    -- SET ROLE is not allowed inside a SECURITY DEFINER function: grant directly instead
+    IF v_def_k IS NOT NULL AND w.suggested_fix ~ '^SET ROLE' THEN
+      detail := w.detail || '. SET ROLE is not allowed inside a SECURITY DEFINER function, so only a direct (or inherited) grant to the owner helps';
+      suggested_fix := CASE WHEN w.check_name = 'schema USAGE' OR (w.check_name LIKE '% privilege' AND w.okind = 'schema' AND w.act = 'USAGE')
+                              THEN format('GRANT USAGE ON SCHEMA %I TO %s;', COALESCE(w.oschema, btrim(w.display, '"')), v_rname)
+                            ELSE format('GRANT %s ON %s %s TO %s;', w.act, public.access__keyword(w.okind), w.display, v_rname) END
+                       || COALESCE(E'\n-- or let the owner inherit it: ' || substring(w.suggested_fix FROM '-- or inherit it: (.*)$'), '');
+    END IF;
+    IF suggested_fix IS NOT NULL AND NOT (suggested_fix = ANY (v_fixes)) THEN
+      v_fixes := v_fixes || suggested_fix;
     END IF;
     RETURN NEXT;
   END LOOP;
@@ -1406,8 +2481,18 @@ BEGIN
     END LOOP;
   END IF;
   v_n := v_n + 1; step := v_n; finding := 'fix (review, then run it yourself)';
-  detail := CASE WHEN v_ambig THEN 'the action is a guess list: pick one before running' ELSE NULL END;
-  suggested_fix := NULLIF(array_to_string(v_fixes, E'\n'), '');
+  detail := CASE WHEN v_ambig THEN 'the action is a guess list: pick one before running'
+                 WHEN EXISTS (SELECT 1 FROM unnest(string_to_array(array_to_string(v_ctx_fixes, E'\n'), E'\n')) AS c(l)
+                               WHERE btrim(c.l) <> '' AND c.l NOT LIKE '--%'
+                                 AND NOT (c.l = ANY (string_to_array(array_to_string(v_fixes, E'\n'), E'\n'))))
+                   THEN 'includes what the rest of the failing statement needs, so it does not fail again on the next check'
+                 ELSE NULL END;
+  -- one line per fix, first occurrence kept
+  SELECT string_agg(u.l, E'\n' ORDER BY u.l LIKE '--%', u.first) INTO suggested_fix
+    FROM (SELECT x.l, min(x.ord) AS first
+            FROM unnest(string_to_array(array_to_string(v_fixes || v_ctx_fixes, E'\n'), E'\n')) WITH ORDINALITY AS x(l, ord)
+           WHERE btrim(x.l) <> ''
+           GROUP BY x.l) u;
   RETURN NEXT;
 END
 $fn$;
@@ -1681,6 +2766,8 @@ AS $fn$
       CROSS JOIN LATERAL (SELECT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass
                                            AND d.objid = p.oid AND d.deptype = 'e') AS e) ext
      WHERE p.prosecdef AND NOT public.access__is_system_schema(n.nspname)
+       -- trigger functions cannot be called directly, so PUBLIC EXECUTE on them is harmless
+       AND p.prorettype NOT IN ('trigger'::regtype, 'event_trigger'::regtype)
        AND EXISTS (SELECT 1 FROM aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) a
                     WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')
     UNION ALL
@@ -1778,7 +2865,9 @@ SET search_path = pg_catalog, pg_temp
 AS $fn$
   VALUES
     ('access_why', 'can role X do ACTION on OBJECT, which grant gives it, what blocks it', 'SELECT * FROM access_why(''app_user'', ''sales.orders'', ''SELECT'');'),
-    ('access_explain_error', 'turn a permission-denied message into the missing grant and a fix', 'SELECT * FROM access_explain_error(''ERROR: permission denied for table orders'', ''app_user'');'),
+    ('access_explain_error', 'turn a permission-denied message into the missing grant and a fix; reads CONTEXT / Where: lines to blame the function owner or the caller', 'SELECT * FROM access_explain_error(''ERROR: permission denied for table orders'', ''app_user'');'),
+    ('access_function_check', 'whose privileges count inside a function (SECURITY DEFINER = owner, INVOKER = caller) and whether that role can reach every object the body names', 'SELECT * FROM access_function_check(''cfg.fn_config_audit_trg()'', ''cfg_user'');'),
+    ('access_trigger_check', 'every trigger on a table, and whether each trigger function can do its work as the role it runs as', 'SELECT * FROM access_trigger_check(''cfg.app_config'', ''cfg_user'');'),
     ('access_chain', 'every role a role belongs to, with the full path and INHERIT/SET per hop', 'SELECT * FROM access_chain(''app_user'');'),
     ('access_tree', 'indented membership tree (up = belongs to, down = members)', 'SELECT * FROM access_tree(''app_user'');'),
     ('access_tree_mermaid', 'the same tree as a Mermaid graph', 'SELECT access_tree_mermaid(''app_user'');'),
@@ -1807,6 +2896,11 @@ COMMENT ON FUNCTION public.access__sources(oid, aclitem[], text, oid, text) IS '
 COMMENT ON FUNCTION public.access__fmt(text, text, text) IS 'pg-access-inspector: internal';
 COMMENT ON FUNCTION public.access__is_system_schema(name) IS 'pg-access-inspector: internal';
 COMMENT ON FUNCTION public.access__tree_lines(oid, text, text, oid[]) IS 'pg-access-inspector: internal';
+COMMENT ON FUNCTION public.access__tokens(text) IS 'pg-access-inspector: internal';
+COMMENT ON FUNCTION public.access__name_at(text[], text[], integer) IS 'pg-access-inspector: internal';
+COMMENT ON FUNCTION public.access__body_refs(text, text) IS 'pg-access-inspector: internal';
+COMMENT ON FUNCTION public.access__find(text, text, text) IS 'pg-access-inspector: internal';
+COMMENT ON FUNCTION public.access__function_check(oid, oid) IS 'pg-access-inspector: internal';
 COMMENT ON FUNCTION public.access_chain(text) IS 'pg-access-inspector: every role a role belongs to, with path and INHERIT/SET per hop';
 COMMENT ON FUNCTION public.access_why(text, text, text, text) IS 'pg-access-inspector: can a role do an action on an object, and why (not)';
 COMMENT ON FUNCTION public.access_privileges(text, boolean) IS 'pg-access-inspector: effective privileges of a role with their source';
@@ -1814,6 +2908,9 @@ COMMENT ON FUNCTION public.access_default_privileges(text, text) IS 'pg-access-i
 COMMENT ON FUNCTION public.access_who_can(text, text, text, boolean) IS 'pg-access-inspector: roles that can do an action on an object';
 COMMENT ON FUNCTION public.access_red_flags(text) IS 'pg-access-inspector: problems with one role or every role';
 COMMENT ON FUNCTION public.access_explain_error(text, text, text) IS 'pg-access-inspector: explain a permission-denied error and suggest a fix';
+COMMENT ON FUNCTION public.access_function_check(text, text) IS 'pg-access-inspector: whose privileges count inside a function, and can that role reach what the body names';
+COMMENT ON FUNCTION public.access_function_check(regprocedure, text) IS 'pg-access-inspector: whose privileges count inside a function, and can that role reach what the body names';
+COMMENT ON FUNCTION public.access_trigger_check(text, text) IS 'pg-access-inspector: triggers on a table and whether their functions can do their work';
 COMMENT ON FUNCTION public.access_compare(text, text, text) IS 'pg-access-inspector: differences between two roles';
 COMMENT ON FUNCTION public.access_tree(text, text) IS 'pg-access-inspector: indented membership tree';
 COMMENT ON FUNCTION public.access_tree_mermaid(text, text) IS 'pg-access-inspector: membership graph as Mermaid';

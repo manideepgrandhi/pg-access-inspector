@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - Unreleased
+
+### Added
+- `access_function_check(function [, caller_role])`: whose privileges count
+  inside a function (owner for SECURITY DEFINER, caller for SECURITY INVOKER),
+  owner and its login flag, schema owner, pinned `search_path`, language, and a
+  best-effort scan of PL/pgSQL and SQL bodies. Every table, sequence and
+  function the body names is checked for the effective role, with the line
+  number, schema USAGE, the missing grant and a suggested fix. Flags SECURITY
+  DEFINER without a pinned or with an unsafe `search_path`, an owner without
+  USAGE on its own schema, and owner grants that only arrive through NOINHERIT
+  memberships. Dynamic SQL and unresolvable names are reported as `CANNOT
+  VERIFY`. Accepts text or `regprocedure`.
+- `access_trigger_check(table [, caller_role])`: every user trigger on a table
+  with timing, events and enabled state, the caller's own privilege for the
+  triggering events, and `access_function_check` for each trigger function.
+- `psql/access_checks.sql`: sections 7 (`-v function=...`) and 8
+  (`-v table=...`) for a function's effective role and a table's triggers.
+- Tests for both, verified against the server, on PostgreSQL 14 to 17.
+
+### Changed
+- `access_explain_error` reads `CONTEXT:` / `Where:` lines (`PL/pgSQL function
+  X line N`, `SQL function "X" statement N`). When the statement ran inside a
+  SECURITY DEFINER function it checks the function owner instead of the
+  caller, shows the statement at line N, the objects it names, and states
+  whose privilege is missing (`whose privilege: OWNER ...` or `CALLER ...`).
+  The fix covers the whole failing statement, replaces `SET ROLE` advice with
+  direct grants where `SET ROLE` cannot work, and drops database CONNECT
+  checks for errors raised inside a function. Messages without a function
+  context behave as before.
+- Function names with argument types now resolve even when the caller has no
+  USAGE on the function's schema.
+- `access_risky` no longer reports PUBLIC EXECUTE on SECURITY DEFINER trigger
+  functions: they cannot be called directly.
+
 ## [1.0.0] - Unreleased
 
 ### Added

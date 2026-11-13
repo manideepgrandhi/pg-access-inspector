@@ -10,6 +10,9 @@
 --   role    role to check                      (default: the connected user)
 --   object  table/view/sequence, schema or db   (default: skip sections 2 and 5)
 --   action  SELECT, INSERT, USAGE, CONNECT, ... (default: SELECT)
+--   function  schema.name or schema.name(argtypes): who runs it, and what
+--             that role can reach (section 7; role = the caller)
+--   table   schema.table: its triggers and who each one runs as (section 8)
 -- Unqualified table names follow your search_path (to_regclass).
 -- Works on PostgreSQL / Aurora PostgreSQL 14-17; PG16 grant options are read
 -- with to_jsonb(), so the same file runs on every version.
@@ -290,3 +293,79 @@ SELECT f.severity, f.flag, f.detail FROM (
   SELECT 2, 'MEDIUM', 'BYPASSRLS', 'ignores row level security' FROM me WHERE me.rolbypassrls AND NOT me.rolsuper
 ) f
 ORDER BY f.o, f.flag, f.detail;
+
+\if :{?function}
+\echo
+\echo '== 7. Function' :function 'called by' :role ': whose privileges count inside it'
+SELECT format('%I.%I(%s)', n.nspname, p.proname, oidvectortypes(p.proargtypes)) AS function,
+       CASE WHEN p.prosecdef THEN 'SECURITY DEFINER' ELSE 'SECURITY INVOKER' END AS security,
+       CASE WHEN p.prosecdef THEN pg_get_userbyid(p.proowner) ELSE :'role' END AS runs_as,
+       pg_get_userbyid(p.proowner) || CASE WHEN o.rolcanlogin THEN '' ELSE ' (NOLOGIN)' END AS owner,
+       has_schema_privilege(p.proowner, n.oid, 'USAGE') AS owner_usage_on_own_schema,
+       COALESCE((SELECT substr(c, 13) FROM unnest(p.proconfig) c WHERE c LIKE 'search_path=%'),
+                CASE WHEN p.prosecdef THEN 'NOT PINNED (security risk)' ELSE 'not pinned' END) AS search_path,
+       l.lanname AS language
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+  JOIN pg_language l ON l.oid = p.prolang
+  JOIN pg_roles o ON o.oid = p.proowner
+ WHERE n.nspname || '.' || p.proname = :'function'
+    OR format('%s.%s(%s)', n.nspname, p.proname, oidvectortypes(p.proargtypes)) = :'function';
+\echo 'Schema-qualified tables and nextval() sequences named in the body, checked for the role it runs as.'
+\echo 'Rough text scan: comments and strings are not skipped and there are no line numbers; access_function_check() in install.sql is more thorough.'
+WITH f AS (
+  SELECT p.prosrc,
+         CASE WHEN p.prosecdef THEN p.proowner ELSE (SELECT r.oid FROM pg_roles r WHERE r.rolname = :'role') END AS eff
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname || '.' || p.proname = :'function'
+      OR format('%s.%s(%s)', n.nspname, p.proname, oidvectortypes(p.proargtypes)) = :'function'
+), refs AS (
+  SELECT DISTINCT f.eff,
+         CASE WHEN m[2] IS NOT NULL THEN 'USAGE'
+              WHEN m[1] ~* '^insert' THEN 'INSERT' WHEN m[1] ~* '^update' THEN 'UPDATE'
+              WHEN m[1] ~* '^delete' THEN 'DELETE' WHEN m[1] ~* '^truncate' THEN 'TRUNCATE'
+              ELSE 'SELECT' END AS action,
+         lower(m[3]) AS sch, lower(m[4]) AS rel
+    FROM f, regexp_matches(f.prosrc,
+           '(?:\m(insert\s+into|update|delete\s+from|from|join|truncate(?:\s+table)?)\s+(?:only\s+)?|\m(nextval)\s*\(\s*'')([a-z_][a-z0-9_$]*)\.([a-z_][a-z0-9_$]*)', 'gi') AS m
+)
+SELECT refs.action, format('%I.%I', refs.sch, refs.rel) AS object, pg_get_userbyid(refs.eff) AS checked_as,
+       CASE WHEN c.oid IS NULL THEN 'not found' ELSE has_schema_privilege(refs.eff, c.relnamespace, 'USAGE')::text END AS schema_usage,
+       CASE WHEN c.oid IS NULL THEN 'not found'
+            WHEN c.relkind = 'S' THEN has_sequence_privilege(refs.eff, c.oid, refs.action)::text
+            ELSE has_table_privilege(refs.eff, c.oid, refs.action)::text END AS privilege,
+       CASE WHEN c.oid IS NULL THEN NULL
+            ELSE concat_ws(' ',
+                   CASE WHEN NOT has_schema_privilege(refs.eff, c.relnamespace, 'USAGE')
+                        THEN format('GRANT USAGE ON SCHEMA %I TO %I;', refs.sch, pg_get_userbyid(refs.eff)) END,
+                   CASE WHEN NOT CASE WHEN c.relkind = 'S' THEN has_sequence_privilege(refs.eff, c.oid, refs.action)
+                                      ELSE has_table_privilege(refs.eff, c.oid, refs.action) END
+                        THEN format('GRANT %s ON %s %I.%I TO %I;', refs.action,
+                                    CASE WHEN c.relkind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END,
+                                    refs.sch, refs.rel, pg_get_userbyid(refs.eff)) END) END AS suggested_fix
+  FROM refs
+  LEFT JOIN pg_namespace n ON n.nspname = refs.sch
+  LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = refs.rel AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+ WHERE refs.sch NOT IN ('new', 'old', 'excluded')
+ ORDER BY 2, 1;
+\endif
+
+\if :{?table}
+\echo
+\echo '== 8. Triggers on' :table 'and the role each trigger function runs as'
+SELECT t.tgname AS trigger,
+       CASE WHEN t.tgtype::int & 2 <> 0 THEN 'BEFORE' WHEN t.tgtype::int & 64 <> 0 THEN 'INSTEAD OF' ELSE 'AFTER' END
+       || CASE WHEN t.tgtype::int & 1 <> 0 THEN ' ROW' ELSE ' STATEMENT' END AS timing,
+       concat_ws(' OR ', CASE WHEN t.tgtype::int & 4 <> 0 THEN 'INSERT' END, CASE WHEN t.tgtype::int & 16 <> 0 THEN 'UPDATE' END,
+                 CASE WHEN t.tgtype::int & 8 <> 0 THEN 'DELETE' END, CASE WHEN t.tgtype::int & 32 <> 0 THEN 'TRUNCATE' END) AS events,
+       CASE t.tgenabled WHEN 'D' THEN 'disabled' WHEN 'R' THEN 'replica only' WHEN 'A' THEN 'always' ELSE 'enabled' END AS enabled,
+       format('%I.%I(%s)', n.nspname, p.proname, oidvectortypes(p.proargtypes)) AS function,
+       CASE WHEN p.prosecdef THEN pg_get_userbyid(p.proowner) || ' (owner, SECURITY DEFINER)'
+            ELSE :'role' || ' (caller, SECURITY INVOKER)' END AS runs_as
+  FROM pg_trigger t
+  JOIN pg_proc p ON p.oid = t.tgfoid
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE t.tgrelid = to_regclass(:'table') AND NOT t.tgisinternal
+ ORDER BY t.tgname;
+\echo 'Run section 7 for each function above: -v function=<function> -v role=<the role that runs the statement>'
+\endif

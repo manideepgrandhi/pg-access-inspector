@@ -252,3 +252,45 @@ LANGUAGE sql AS $body$
   SELECT count(*) FROM cfg.feature_flags;
   SELECT count(*) FROM cfg.change_log;
 $body$;
+
+-- access_report: 3-level chain with a second path, ownership, column and PUBLIC grants
+-- acme_clerk → acme_rw → acme_ro, and acme_clerk → acme_ro directly
+CREATE ROLE acme_ro NOLOGIN;
+CREATE ROLE acme_rw NOLOGIN;     GRANT acme_ro TO acme_rw;
+CREATE ROLE acme_clerk LOGIN;    GRANT acme_rw TO acme_clerk;  GRANT acme_ro TO acme_clerk;
+CREATE ROLE billing_owner NOLOGIN;
+GRANT CONNECT ON DATABASE inspector_test TO acme_ro;
+GRANT TEMP ON DATABASE inspector_test TO acme_rw;
+CREATE SCHEMA billing AUTHORIZATION billing_owner;
+CREATE SCHEMA billing_arch AUTHORIZATION billing_owner;
+GRANT USAGE ON SCHEMA billing, billing_arch TO acme_ro;
+GRANT CREATE ON SCHEMA billing TO acme_rw;
+SET ROLE billing_owner;
+CREATE TABLE billing.invoices (id serial PRIMARY KEY, account_no text, amount numeric);
+CREATE TABLE billing.clients (id integer, name text, tax_id text);
+CREATE TABLE billing.rates (code text, rate numeric);
+CREATE TABLE billing_arch.old_invoices (id integer, amount numeric);
+GRANT SELECT ON billing.invoices TO acme_ro, acme_clerk;
+GRANT INSERT, UPDATE ON billing.invoices TO acme_rw;
+GRANT USAGE ON SEQUENCE billing.invoices_id_seq TO acme_rw;
+GRANT SELECT (id, name) ON billing.clients TO acme_ro;
+GRANT SELECT ON billing.rates TO PUBLIC;
+GRANT SELECT ON billing_arch.old_invoices TO acme_ro;
+CREATE FUNCTION billing.fn_invoice_total(p_id integer) RETURNS numeric LANGUAGE sql STABLE
+  AS 'SELECT amount FROM billing.invoices WHERE id = p_id';
+REVOKE EXECUTE ON FUNCTION billing.fn_invoice_total(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION billing.fn_invoice_total(integer) TO acme_rw;
+RESET ROLE;
+-- owned directly by the clerk, and owned by a group it inherits
+SET ROLE acme_clerk;
+CREATE TABLE billing.clerk_notes (note text);
+RESET ROLE;
+SET ROLE acme_rw;
+CREATE VIEW billing.invoice_summary AS SELECT count(*) AS n FROM billing.invoices;
+RESET ROLE;
+\if :pg16
+-- PG16+: an INHERIT FALSE grant (SET ROLE only)
+CREATE ROLE acme_admin NOLOGIN CREATEDB;
+GRANT acme_admin TO acme_clerk WITH INHERIT FALSE, SET TRUE;
+GRANT SELECT ON billing.clients TO acme_admin;
+\endif

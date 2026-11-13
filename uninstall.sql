@@ -11,6 +11,7 @@ DROP FUNCTION IF EXISTS public.access_explain_error(text, text, text);
 DROP FUNCTION IF EXISTS public.access_red_flags(text);
 DROP FUNCTION IF EXISTS public.access_who_can(text, text, text, boolean);
 DROP FUNCTION IF EXISTS public.access_default_privileges(text, text);
+DROP FUNCTION IF EXISTS public.access_report(text, text, boolean);
 DROP FUNCTION IF EXISTS public.access_privileges(text, boolean);
 DROP FUNCTION IF EXISTS public.access_trigger_check(text, text);
 DROP FUNCTION IF EXISTS public.access_function_check(regprocedure, text);

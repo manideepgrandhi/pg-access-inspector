@@ -13,6 +13,9 @@
 --   function  schema.name or schema.name(argtypes): who runs it, and what
 --             that role can reach (section 7; role = the caller)
 --   table   schema.table: its triggers and who each one runs as (section 8)
+--   report  any value: full access report for the role (section 9), same rows
+--           as access_report(); optional schema=<name> limits schema and
+--           object rows, include_public=off drops PUBLIC rows
 -- Unqualified table names follow your search_path (to_regclass).
 -- Works on PostgreSQL / Aurora PostgreSQL 14-17; PG16 grant options are read
 -- with to_jsonb(), so the same file runs on every version.
@@ -368,4 +371,133 @@ SELECT t.tgname AS trigger,
  WHERE t.tgrelid = to_regclass(:'table') AND NOT t.tgisinternal
  ORDER BY t.tgname;
 \echo 'Run section 7 for each function above: -v function=<function> -v role=<the role that runs the statement>'
+\endif
+
+\if :{?report}
+\echo
+\echo '== 9. Full access report for' :role '(role, database, schema and object level; one row per path)'
+\if :{?schema}
+\else
+  \set schema ''
+\endif
+\if :{?include_public}
+\else
+  \set include_public on
+\endif
+WITH RECURSIVE edges AS (
+  SELECT m.member, m.roleid,
+         bool_or(COALESCE((to_jsonb(m) ->> 'inherit_option')::boolean, mr.rolinherit)) AS inh,
+         bool_or(COALESCE((to_jsonb(m) ->> 'set_option')::boolean, true)) AS sett,
+         bool_or(m.admin_option) AS adm
+    FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member
+   GROUP BY m.member, m.roleid
+  UNION ALL
+  SELECT d.datdba, o.oid, true, true, false
+    FROM pg_database d JOIN pg_roles o ON o.rolname = 'pg_database_owner'
+   WHERE d.datname = current_database()
+), w(roleid, depth, path, inh, sett, adm) AS (
+  SELECT r.oid, 0, ARRAY[r.oid], true, true, false FROM pg_roles r WHERE r.rolname = :'role'
+  UNION ALL
+  SELECT e.roleid, w.depth + 1, w.path || e.roleid, w.inh AND e.inh, w.sett AND e.sett, e.adm
+    FROM w JOIN edges e ON e.member = w.roleid
+   WHERE NOT e.roleid = ANY (w.path) AND w.depth < 64
+), p AS (
+  SELECT w.roleid, w.depth, w.adm,
+         (SELECT string_agg(r.rolname, ' → ' ORDER BY x.n)
+            FROM unnest(w.path) WITH ORDINALITY x(id, n) JOIN pg_roles r ON r.oid = x.id) AS path_text,
+         CASE WHEN w.inh THEN 0 WHEN w.sett THEN 1 ELSE 2 END AS state
+    FROM w
+), me AS (
+  SELECT r.* FROM pg_roles r WHERE r.rolname = :'role'
+), objs AS (
+  SELECT 2 AS lvl, 'database'::text AS t, quote_ident(d.datname) AS nm, d.datdba AS own,
+         COALESCE(d.datacl, acldefault('d', d.datdba)) AS acl
+    FROM pg_database d WHERE NOT d.datistemplate
+  UNION ALL
+  SELECT 3, 'schema', quote_ident(n.nspname), n.nspowner, COALESCE(n.nspacl, acldefault('n', n.nspowner))
+    FROM pg_namespace n
+   WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp_|toast_temp_)'
+     AND (:'schema' = '' OR n.nspname = :'schema')
+  UNION ALL
+  SELECT 4, CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' WHEN 'v' THEN 'view'
+                           WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' END,
+         format('%I.%I', n.nspname, c.relname), c.relowner,
+         COALESCE(c.relacl, acldefault(CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END::"char", c.relowner))
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+     AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp_|toast_temp_)'
+     AND (:'schema' = '' OR n.nspname = :'schema')
+  UNION ALL
+  SELECT 4, 'column', format('%I.%I.%I', n.nspname, c.relname, a.attname), c.relowner, a.attacl
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE a.attacl IS NOT NULL AND a.attnum > 0 AND NOT a.attisdropped
+     AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp_|toast_temp_)'
+     AND (:'schema' = '' OR n.nspname = :'schema')
+  UNION ALL
+  SELECT 4, CASE pr.prokind WHEN 'p' THEN 'procedure' WHEN 'a' THEN 'aggregate' WHEN 'w' THEN 'window function'
+                            ELSE 'function' END,
+         pr.oid::regprocedure::text, pr.proowner, COALESCE(pr.proacl, acldefault('f', pr.proowner))
+    FROM pg_proc pr JOIN pg_namespace n ON n.oid = pr.pronamespace
+   WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp_|toast_temp_)'
+     AND (:'schema' = '' OR n.nspname = :'schema')
+     AND COALESCE(obj_description(pr.oid, 'pg_proc'), '') NOT LIKE 'pg-access-inspector:%'
+), acl AS (
+  SELECT o.lvl, o.t, o.nm, o.own, e.grantee, e.privilege_type AS priv, bool_or(e.is_grantable) AS grantable
+    FROM objs o, aclexplode(o.acl) e
+   GROUP BY o.lvl, o.t, o.nm, o.own, e.grantee, e.privilege_type
+), rows AS (
+  SELECT 1 AS lvl, 'attribute'::text AS t, me.rolname::text AS nm, a.attr AS priv, 'direct'::text AS via,
+         false AS grantable, 0 AS state
+    FROM me CROSS JOIN LATERAL (VALUES (me.rolsuper, 'SUPERUSER'), (me.rolcreaterole, 'CREATEROLE'),
+                                       (me.rolcreatedb, 'CREATEDB'), (me.rolbypassrls, 'BYPASSRLS'),
+                                       (me.rolcanlogin, 'LOGIN'), (me.rolreplication, 'REPLICATION')) a(isset, attr)
+   WHERE a.isset
+  UNION ALL
+  SELECT 1, 'superuser', '*', 'ALL',
+         'SUPERUSER attribute: bypasses every privilege check (database, schema and object rows are not listed)', true, 0
+    FROM me WHERE me.rolsuper
+  UNION ALL
+  SELECT 1, 'attribute', r.rolname::text, a.attr,
+         CASE WHEN p.state < 2 THEN 'needs SET ROLE: ' ELSE 'not usable (no INHERIT, no SET): ' END || p.path_text,
+         false, CASE WHEN p.state < 2 THEN 1 ELSE 2 END
+    FROM p JOIN pg_roles r ON r.oid = p.roleid
+    CROSS JOIN LATERAL (VALUES (r.rolsuper, 'SUPERUSER'), (r.rolcreaterole, 'CREATEROLE'), (r.rolcreatedb, 'CREATEDB'),
+                               (r.rolbypassrls, 'BYPASSRLS'), (r.rolreplication, 'REPLICATION')) a(isset, attr)
+   WHERE p.depth > 0 AND a.isset
+  UNION ALL
+  SELECT 1, CASE WHEN r.rolname ~ '^(pg|rds)_' THEN 'predefined role' ELSE 'member of' END, r.rolname::text,
+         CASE r.rolname
+           WHEN 'pg_read_all_data'  THEN 'SELECT on all tables, views and sequences; USAGE on all schemas'
+           WHEN 'pg_write_all_data' THEN 'INSERT, UPDATE, DELETE on all tables, views and sequences; USAGE on all schemas'
+           WHEN 'pg_maintain'       THEN 'VACUUM, ANALYZE, REINDEX, REFRESH, CLUSTER, LOCK on all relations'
+           WHEN 'pg_database_owner' THEN 'owner of the current database'
+           WHEN 'rds_superuser'     THEN 'RDS/Aurora admin role (not a real superuser)'
+           ELSE 'MEMBER' END,
+         CASE p.state WHEN 0 THEN '' WHEN 1 THEN 'needs SET ROLE: ' ELSE 'not usable (no INHERIT, no SET): ' END || p.path_text,
+         p.adm, p.state
+    FROM p JOIN pg_roles r ON r.oid = p.roleid
+   WHERE p.depth > 0
+  UNION ALL
+  SELECT a.lvl, a.t, a.nm, a.priv,
+         CASE WHEN a.grantee = 0 THEN 'PUBLIC' WHEN p.depth = 0 THEN 'direct'
+              ELSE CASE p.state WHEN 0 THEN '' WHEN 1 THEN 'needs SET ROLE: '
+                                ELSE 'not usable (no INHERIT, no SET): ' END || p.path_text END,
+         a.grantable, COALESCE(p.state, 0)
+    FROM acl a LEFT JOIN p ON p.roleid = a.grantee
+   WHERE ((a.grantee = 0 AND :'include_public'::boolean) OR p.roleid IS NOT NULL) AND a.grantee <> a.own
+  UNION ALL
+  SELECT o.lvl, o.t, o.nm, 'OWNER',
+         CASE WHEN p.depth = 0 THEN 'owner'
+              ELSE CASE p.state WHEN 0 THEN '' WHEN 1 THEN 'needs SET ROLE: '
+                                ELSE 'not usable (no INHERIT, no SET): ' END || p.path_text || ' (owner)' END,
+         true, p.state
+    FROM objs o JOIN p ON p.roleid = o.own
+   WHERE o.t <> 'column'
+)
+SELECT CASE rows.lvl WHEN 1 THEN 'role' WHEN 2 THEN 'database' WHEN 3 THEN 'schema' ELSE 'object' END AS level,
+       rows.t AS object_type, rows.nm AS object_name, rows.priv AS privilege, rows.via, rows.grantable AS grant_option
+  FROM rows
+ WHERE rows.lvl = 1 OR NOT EXISTS (SELECT 1 FROM me WHERE me.rolsuper)
+ ORDER BY rows.lvl, rows.t = 'superuser' DESC, rows.t, rows.nm, rows.priv = 'OWNER' DESC, rows.priv, rows.state,
+          CASE WHEN rows.via IN ('direct', 'owner') THEN 0 WHEN rows.via = 'PUBLIC' THEN 2 ELSE 1 END, rows.via;
 \endif

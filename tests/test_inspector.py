@@ -727,6 +727,176 @@ class Privileges(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+def report(role, schema=None, include_public=True):
+    sch = 'NULL' if schema is None else lit(schema)
+    return q(f"SELECT level, object_type, object_name, privilege, via, grant_option "
+             f"FROM access_report({lit(role)}, {sch}, {'true' if include_public else 'false'})")
+
+
+def active(via):
+    return not via.startswith(('needs SET ROLE', 'not usable'))
+
+
+class Report(unittest.TestCase):
+    def test_three_level_chain_every_path_is_a_row(self):
+        rows = report('acme_clerk', 'billing')
+        sel = sorted(r[4] for r in rows if r[2] == 'billing.invoices' and r[3] == 'SELECT')
+        self.assertEqual(sel, ['acme_clerk → acme_ro', 'acme_clerk → acme_rw → acme_ro', 'direct'])
+        self.assertIn(['object', 'table', 'billing.invoices', 'INSERT', 'acme_clerk → acme_rw', 'f'], rows)
+        self.assertIn(['object', 'sequence', 'billing.invoices_id_seq', 'USAGE', 'acme_clerk → acme_rw', 'f'], rows)
+        self.assertIn(['object', 'function', 'billing.fn_invoice_total(integer)', 'EXECUTE', 'acme_clerk → acme_rw', 'f'], rows)
+        self.assertIn(['schema', 'schema', 'billing', 'CREATE', 'acme_clerk → acme_rw', 'f'], rows)
+        self.assertIn(['role', 'member of', 'acme_ro', 'MEMBER', 'acme_clerk → acme_rw → acme_ro', 'f'], rows)
+        self.assertIn(['role', 'attribute', 'acme_clerk', 'LOGIN', 'direct', 'f'], rows)
+        self.assertEqual([r[0] for r in rows], sorted((r[0] for r in rows),
+                         key=['role', 'database', 'schema', 'object'].index))
+
+    def test_ownership_direct_and_inherited(self):
+        rows = report('acme_clerk', 'billing')
+        self.assertIn(['object', 'table', 'billing.clerk_notes', 'OWNER', 'owner', 't'], rows)
+        self.assertIn(['object', 'view', 'billing.invoice_summary', 'OWNER', 'acme_clerk → acme_rw (owner)', 't'], rows)
+        self.assertFalse([r for r in rows if r[2] == 'billing.clerk_notes' and r[3] != 'OWNER'])
+        rows = report('db_owner_role', include_public=False)
+        self.assertIn(['database', 'database', 'inspector_test', 'OWNER', 'owner', 't'], rows)
+        self.assertIn(['role', 'predefined role', 'pg_database_owner', 'owner of the current database',
+                       'db_owner_role → pg_database_owner', 'f'], rows)
+
+    def test_column_grants(self):
+        rows = report('acme_clerk', 'billing')
+        cols = {(r[2], r[4]) for r in rows if r[1] == 'column'}
+        self.assertEqual(cols, {(f'billing.clients.{c}', v) for c in ('id', 'name')
+                                for v in ('acme_clerk → acme_ro', 'acme_clerk → acme_rw → acme_ro')})
+        self.assertTrue(works_as('acme_clerk', 'SELECT id, name FROM billing.clients'))
+        self.assertFalse(works_as('acme_clerk', 'SELECT tax_id FROM billing.clients'))
+
+    def test_public_rows_and_include_public_false(self):
+        rows = report('acme_clerk', 'billing')
+        self.assertIn(['object', 'table', 'billing.rates', 'SELECT', 'PUBLIC', 'f'], rows)
+        self.assertIn(['database', 'database', 'postgres', 'CONNECT', 'PUBLIC', 'f'], rows)
+        rows = report('acme_clerk', 'billing', include_public=False)
+        self.assertFalse([r for r in rows if r[4] == 'PUBLIC'])
+        self.assertFalse([r for r in rows if r[2] == 'billing.rates'])
+        self.assertIn(['object', 'table', 'billing.invoices', 'SELECT', 'direct', 'f'], rows)
+
+    def test_database_level(self):
+        rows = report('acme_clerk', 'billing')
+        db = {(r[2], r[3], r[4]) for r in rows if r[0] == 'database'}
+        self.assertIn(('inspector_test', 'CONNECT', 'acme_clerk → acme_ro'), db)
+        self.assertIn(('inspector_test', 'CONNECT', 'acme_clerk → acme_rw → acme_ro'), db)
+        self.assertIn(('inspector_test', 'TEMPORARY', 'acme_clerk → acme_rw'), db)
+        self.assertIn(('inspector_test', 'TEMPORARY', 'PUBLIC'), db)
+        self.assertNotIn(('inspector_test', 'CONNECT', 'PUBLIC'), db)  # revoked in the fixture
+        self.assertFalse([r for r in db if r[0].startswith('template')])
+        self.assertTrue(works_as('acme_clerk', 'CREATE TEMP TABLE t_scratch (x int)'))
+
+    def test_schema_filter(self):
+        rows = report('acme_clerk', 'billing')
+        names = {r[2] for r in rows if r[0] in ('schema', 'object')}
+        self.assertTrue(all(n == 'billing' or n.startswith('billing.') for n in names), names)
+        self.assertTrue([r for r in rows if r[0] == 'database'])  # not filtered
+        rows = report('acme_clerk', 'billing_arch')
+        self.assertEqual({(r[2], r[3]) for r in rows if r[0] in ('schema', 'object')},
+                         {('billing_arch', 'USAGE'), ('billing_arch.old_invoices', 'SELECT')})
+        everything = {r[2] for r in report('acme_clerk')}
+        self.assertTrue({'billing.invoices', 'billing_arch.old_invoices', 'audit.events'} <= everything)
+        err = sql_error("SELECT * FROM access_report('acme_clerk', 'no_such_schema')")
+        self.assertIn('schema "no_such_schema" does not exist', err)
+
+    def test_noinherit_is_listed_as_needs_set_role(self):
+        rows = report('report_user', 'finance', include_public=False)
+        self.assertIn(['object', 'table', 'finance.ledger', 'SELECT', 'needs SET ROLE: report_user → reporting', 'f'], rows)
+        self.assertIn(['schema', 'schema', 'finance', 'USAGE', 'needs SET ROLE: report_user → reporting', 'f'], rows)
+        self.assertFalse([r for r in rows if r[0] in ('schema', 'object') and active(r[4])])
+        self.assertFalse(works_as('report_user', 'SELECT * FROM finance.ledger'))
+
+    @unittest.skipIf(PGV < 16, 'per-grant INHERIT FALSE needs PostgreSQL 16+')
+    def test_pg16_inherit_false_grant(self):
+        rows = report('acme_clerk', 'billing')
+        self.assertIn(['object', 'table', 'billing.clients', 'SELECT', 'needs SET ROLE: acme_clerk → acme_admin', 'f'], rows)
+        self.assertIn(['role', 'attribute', 'acme_admin', 'CREATEDB', 'needs SET ROLE: acme_clerk → acme_admin', 'f'], rows)
+        self.assertFalse(works_as('acme_clerk', 'SELECT tax_id FROM billing.clients'))
+        rows = report('ops_user', 'ops')
+        self.assertIn(['object', 'table', 'ops.secrets', 'SELECT', 'ops_user → vault', 'f'], rows)
+        self.assertIn(['object', 'table', 'ops.jobs', 'SELECT', 'needs SET ROLE: ops_user → ops_admin', 'f'], rows)
+        self.assertIn(['object', 'table', 'ops.dead', 'SELECT', 'not usable (no INHERIT, no SET): ops_user → dead_end', 'f'], rows)
+
+    def test_superuser_flag(self):
+        rows = report('legacy_su')
+        self.assertEqual(rows[0][:4], ['role', 'superuser', '*', 'ALL'])
+        self.assertIn('bypasses every privilege check', rows[0][4])
+        self.assertEqual({r[0] for r in rows}, {'role'})
+        rows = report('legacy_admin', include_public=False)
+        self.assertIn(['role', 'attribute', 'legacy_su', 'SUPERUSER', 'needs SET ROLE: legacy_admin → legacy_su', 'f'], rows)
+        self.assertFalse([r for r in rows if r[1] == 'superuser'])
+
+    def test_predefined_roles(self):
+        rows = report('auditor', include_public=False)
+        self.assertIn('pg_read_all_data', {r[2] for r in rows if r[1] == 'predefined role'})
+        rows = report('dba_user', include_public=False)
+        self.assertIn(['role', 'predefined role', 'rds_superuser', 'RDS/Aurora admin role (not a real superuser)',
+                       'dba_user → dba_team → rds_superuser', 'f'], rows)
+        self.assertIn(['role', 'attribute', 'rds_superuser', 'CREATEROLE',
+                       'needs SET ROLE: dba_user → dba_team → rds_superuser', 'f'], rows)
+
+    def test_excludes_system_and_own_functions(self):
+        names = {r[2] for r in report('app_user')}
+        self.assertFalse([n for n in names if n.startswith(('pg_catalog.', 'information_schema.', 'pg_toast.',
+                                                             'public.access_'))])
+
+    def test_active_rows_match_server(self):
+        """Active table, schema and database rows equal has_*_privilege() for the role."""
+        for role in ('acme_clerk', 'app_user', 'hr_reader', 'db_owner_role'):
+            diff = q(f"""
+              WITH r AS (SELECT * FROM access_report({lit(role)})
+                          WHERE via NOT LIKE 'needs SET ROLE%' AND via NOT LIKE 'not usable%'),
+              tabprivs(priv) AS (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'),
+                                        ('REFERENCES'), ('TRIGGER')),
+              listed AS (
+                SELECT object_name, privilege FROM r
+                 WHERE object_type IN ('table', 'view', 'materialized view', 'foreign table', 'schema', 'database')
+                   AND privilege <> 'OWNER' AND privilege <> 'MAINTAIN'
+                UNION
+                SELECT r.object_name, x.priv FROM r
+                  CROSS JOIN LATERAL (SELECT priv FROM tabprivs WHERE r.level = 'object'
+                                      UNION ALL SELECT unnest(ARRAY['USAGE', 'CREATE']) WHERE r.level = 'schema'
+                                      UNION ALL SELECT unnest(ARRAY['CONNECT', 'CREATE', 'TEMPORARY'])
+                                       WHERE r.level = 'database') x
+                 WHERE r.privilege = 'OWNER'
+                   AND r.object_type IN ('table', 'view', 'materialized view', 'foreign table', 'schema', 'database')),
+              real AS (
+                SELECT format('%I.%I', n.nspname, c.relname), t.priv
+                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace CROSS JOIN tabprivs t
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                   AND has_table_privilege({lit(role)}, c.oid, t.priv)
+                UNION
+                SELECT quote_ident(n.nspname), x.priv FROM pg_namespace n, unnest(ARRAY['USAGE', 'CREATE']) x(priv)
+                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp_|toast_temp_)'
+                   AND has_schema_privilege({lit(role)}, n.oid, x.priv)
+                UNION
+                SELECT quote_ident(d.datname), x.priv FROM pg_database d, unnest(ARRAY['CONNECT', 'CREATE', 'TEMPORARY']) x(priv)
+                 WHERE NOT d.datistemplate AND has_database_privilege({lit(role)}, d.oid, x.priv))
+              (SELECT 'extra', * FROM listed EXCEPT SELECT 'extra', * FROM real)
+              UNION ALL
+              (SELECT 'missing', * FROM real EXCEPT SELECT 'missing', * FROM listed)
+            """)
+            self.assertEqual(diff, [], role)
+
+    def test_psql_file_section_matches_function(self):
+        env = dict(os.environ, PGOPTIONS='-c default_transaction_read_only=on')
+        for args, call in ((['-v', 'role=acme_clerk', '-v', 'schema=billing'], "'acme_clerk', 'billing'"),
+                           (['-v', 'role=report_user', '-v', 'include_public=off'], "'report_user', NULL, false"),
+                           (['-v', 'role=legacy_su'], "'legacy_su'")):
+            res = subprocess.run(['psql', '-X', '-At', '-v', 'ON_ERROR_STOP=1', '-d', DB, *args, '-v', 'report=1',
+                                  '-f', str(ROOT / 'psql' / 'access_checks.sql')],
+                                 text=True, capture_output=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            out = res.stdout.split('== 9.', 1)[1].split('\n', 1)[1].strip()
+            fn = subprocess.run(['psql', '-X', '-At', '-d', DB, '-c', f"SELECT * FROM access_report({call})"],
+                                text=True, capture_output=True, check=True).stdout.strip()
+            self.assertEqual(out, fn, args)
+
+
+# --------------------------------------------------------------------------
 class DefaultPrivileges(unittest.TestCase):
     def test_covered_and_not_covered_creators(self):
         rows = q("SELECT creator_role, schema_name, privileges, grantee, how, note FROM access_default_privileges('app_user')")
@@ -919,6 +1089,8 @@ ALL_CALLS = [
     "SELECT * FROM access_chain('app_user')",
     "SELECT * FROM access_why('app_user', 'sales.orders', 'SELECT')",
     "SELECT * FROM access_privileges('app_user')",
+    "SELECT * FROM access_report('app_user')",
+    "SELECT * FROM access_report('acme_clerk', 'billing', false)",
     "SELECT * FROM access_default_privileges('app_user')",
     "SELECT * FROM access_who_can('sales.orders', 'SELECT')",
     "SELECT * FROM access_red_flags()",

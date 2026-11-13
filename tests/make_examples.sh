@@ -8,7 +8,7 @@ VER=$(psql -X -At -c "SELECT current_setting('server_version')" | cut -d' ' -f1)
 
 ex() {  # ex <title> <story> <sql> [raw]
   {
-    printf '\n## %s\n\n' "$1"
+    [[ -n "$1" ]] && printf '\n## %s\n\n' "$1"
     [[ -n "$2" ]] && printf '%s\n\n' "$2"
     printf '```sql\n%s\n```\n\n```%s\n' "$3" "$([[ "${4:-}" == raw ]] && echo mermaid || echo text)"
     if [[ "${4:-}" == raw ]]; then
@@ -35,6 +35,7 @@ The fixture has, among others:
 - \`hr_reader\` with column grants on \`hr.employees\`
 - \`sales.orders\` with row level security and one policy for \`sales_emea\`
 - default privileges for \`app_owner\` in \`sales\`, but tables there are also created by \`etl_owner\`
+- schema \`cfg\` with audit triggers: \`cfg.fn_config_audit_trg()\` is SECURITY DEFINER and its owner \`audit_owner\` has no USAGE on \`cfg\`; \`cfg.fn_flag_audit_trg()\` is SECURITY INVOKER and the caller \`cfg_user\` cannot insert into its audit table
 HDR
 
 ex "1. Multi-level inheritance: where does the access come from?" \
@@ -118,6 +119,73 @@ ex "15. Mermaid diagram for a ticket" \
     "psql -X -d inspector_test -v role=report_user -v object=finance.ledger -v action=SELECT -f psql/access_checks.sql"
   psql -X -P pager=off -v role=report_user -v object=finance.ledger -v action=SELECT -f "$ROOT/psql/access_checks.sql" \
     | sed -n '/^== 2\./,/^== 3\./p' | sed -e '$d' -e 's/[[:space:]]*$//' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+  printf '```\n'
+} >>"$OUT"
+sqlq() { printf '%s' "$1" | sed "s/'/''/g"; }
+
+# Functions and triggers: errors captured from a real session as cfg_user
+ERR_DEF=$(psql -X -U cfg_user -c "UPDATE cfg.app_config SET value = '60' WHERE key = 'timeout'" 2>&1 >/dev/null || true)
+ERR_INV=$(psql -X -U cfg_user -c "INSERT INTO cfg.feature_flags VALUES ('beta', true)" 2>&1 >/dev/null || true)
+
+{
+  printf '\n## 17. Error inside a SECURITY DEFINER trigger: the owner is missing the privilege\n\n%s\n\n' \
+    "A made-up copy of a real case. \`cfg_user\` can update \`cfg.app_config\`, but the UPDATE fires the audit trigger \`cfg.fn_config_audit_trg()\`, which is SECURITY DEFINER. Its owner \`audit_owner\` has INSERT on \`cfg.config_audit\` but no USAGE on schema \`cfg\`. The error psql printed for \`UPDATE cfg.app_config SET value = '60' WHERE key = 'timeout'\`:"
+  printf '```text\n%s\n```\n\n' "$ERR_DEF"
+  printf '%s\n\n' "Paste all of it, CONTEXT line included (a client's \`Where:\` line works too):"
+} >>"$OUT"
+ex "" "" "SELECT step, finding, detail, suggested_fix
+  FROM access_explain_error('$(sqlq "$ERR_DEF")', 'cfg_user');"
+
+ex "18. Check a function before it fails" \
+"Who \`cfg.fn_config_audit_trg()\` runs as, and whether that role can reach every object its body names. Line numbers match the ones in PL/pgSQL CONTEXT lines. The sequence row comes from the \`bigserial\` default on \`cfg.config_audit.id\`." \
+"SELECT step, check_name, line, object, action, result, detail, suggested_fix
+  FROM access_function_check('cfg.fn_config_audit_trg()', 'cfg_user');"
+
+ex "19. Every trigger on a table" \
+"The caller's own privilege for each triggering event, then each trigger with the role its function really runs as." \
+"SELECT trigger_name, timing, events, enabled, check_name, line, object, action, result, detail
+  FROM access_trigger_check('cfg.app_config', 'cfg_user');"
+
+{
+  printf '\n## 20. Error inside a SECURITY INVOKER trigger: the caller is missing the privilege\n\n%s\n\n' \
+    "Same shape, but \`cfg.fn_flag_audit_trg()\` is SECURITY INVOKER, so it runs as \`cfg_user\`, which may read \`cfg.flag_audit\` but not insert into it. The error for \`INSERT INTO cfg.feature_flags VALUES ('beta', true)\`:"
+  printf '```text\n%s\n```\n\n' "$ERR_INV"
+} >>"$OUT"
+ex "" "" "SELECT step, finding, detail, suggested_fix
+  FROM access_explain_error('$(sqlq "$ERR_INV")', 'cfg_user');"
+
+ex "21. SECURITY DEFINER owner that only has access through NOINHERIT" \
+"\`noinh_owner\` is NOINHERIT and gets USAGE on \`cfg\` and INSERT on \`cfg.change_log\` only through \`cfg_writer\`. Outside a function \`SET ROLE cfg_writer\` would help; inside a SECURITY DEFINER function \`SET ROLE\` is not allowed, so the fix is a direct grant." \
+"SELECT check_name, line, object, action, result, suggested_fix
+  FROM access_function_check('cfg.fn_log_change(text)', 'cfg_user')
+ WHERE check_name IN ('runs as', 'owner NOINHERIT', 'reference', 'summary');"
+
+ex "22. Security warnings, unqualified names and dynamic SQL" \
+"\`cfg.fn_next_change_id()\` is SECURITY DEFINER with no pinned search_path, uses \`nextval('cfg.change_seq')\` and an unqualified \`app_config\`. \`cfg.fn_count_flags()\` pins \`search_path = cfg, pg_temp\`, so its unqualified names resolve there. \`cfg.fn_purge(text)\` builds its SQL at run time." \
+"SELECT function_name, check_name, line, object, action, result, detail
+  FROM access_function_check('cfg.fn_next_change_id()', 'cfg_user')
+ WHERE check_name IN ('search_path', 'reference', 'summary')
+UNION ALL
+SELECT function_name, check_name, line, object, action, result, detail
+  FROM access_function_check('cfg.fn_count_flags()', 'cfg_user')
+ WHERE check_name IN ('search_path', 'reference')
+UNION ALL
+SELECT function_name, check_name, line, object, action, result, detail
+  FROM access_function_check('cfg.fn_purge(text)', 'cfg_user')
+ WHERE check_name IN ('dynamic SQL', 'summary');"
+
+ex "23. SQL-language function" \
+"Errors from \`LANGUAGE sql\` functions say \`SQL function \"fn_sql_counts\" statement 2\`; the check reports the line of each statement." \
+"SELECT check_name, line, object, action, result, source_line
+  FROM access_function_check('cfg.fn_sql_counts()', 'cfg_user')
+ WHERE check_name IN ('runs as', 'reference', 'summary');"
+
+{
+  printf '\n## 24. No-install function and trigger check\n\n%s\n\n```sh\n%s\n```\n\n```text\n' \
+    "Sections 7 and 8 of the psql file, for databases where you cannot install functions:" \
+    "psql -X -d inspector_test -v role=cfg_user -v function=cfg.fn_config_audit_trg -v table=cfg.app_config -f psql/access_checks.sql"
+  psql -X -P pager=off -v role=cfg_user -v function=cfg.fn_config_audit_trg -v table=cfg.app_config -f "$ROOT/psql/access_checks.sql" \
+    | sed -n '/^== 7\./,$p' | sed -e 's/[[:space:]]*$//' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
   printf '```\n'
 } >>"$OUT"
 echo "wrote $OUT"

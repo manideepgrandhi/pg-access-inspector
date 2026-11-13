@@ -352,6 +352,341 @@ class ExplainError(unittest.TestCase):
         self.assertIn('already has', self.find(rows, 'action')[0][2])
 
 
+
+# --------------------------------------------------------------------------
+# Functions and triggers. The fixture's cfg schema reproduces a real case:
+# an UPDATE fails inside a SECURITY DEFINER audit trigger because the
+# function OWNER has no USAGE on the schema (the caller is fine).
+def fcheck(func, caller='cfg_user', where=''):
+    """[{check_name, line, object, action, result, detail, fix, source_line}] in step order."""
+    rows = q(f"SELECT check_name, coalesce(line::text, ''), coalesce(object, ''), coalesce(action, ''), result, "
+             f"coalesce(detail, ''), coalesce(suggested_fix, ''), coalesce(source_line, '') "
+             f"FROM access_function_check({lit(func)}, {lit(caller)}) {where} ORDER BY function_name, step")
+    keys = ('check', 'line', 'object', 'action', 'result', 'detail', 'fix', 'source')
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def by_check(rows, name):
+    return [r for r in rows if r['check'] == name]
+
+
+def login_error(user, statement):
+    """Run a statement logged in as the role; return the full error text with
+    its LINE / QUERY / CONTEXT lines exactly as psql prints them."""
+    res = run(statement, user=user, check=False)
+    assert res.returncode != 0, f'expected {user} to fail: {statement}'
+    return res.stderr.strip()
+
+
+def server_agrees(role, obj, action):
+    """PostgreSQL's own answer for role/object/action, schema USAGE included."""
+    kind = q1(f"SELECT relkind FROM pg_class WHERE oid = to_regclass({lit(obj)})")
+    if kind is None:
+        return q1(f"SELECT has_function_privilege({lit(role)}, {lit(obj)}, {lit(action)}) AND "
+                  f"has_schema_privilege({lit(role)}, (SELECT pronamespace FROM pg_proc WHERE oid = {lit(obj)}::regprocedure), 'USAGE')")
+    fn = 'has_sequence_privilege' if kind == 'S' else 'has_table_privilege'
+    return q1(f"SELECT {fn}({lit(role)}, {lit(obj)}, {lit(action)}) AND "
+              f"has_schema_privilege({lit(role)}, (SELECT relnamespace FROM pg_class WHERE oid = {lit(obj)}::regclass), 'USAGE')")
+
+
+class FunctionCheck(unittest.TestCase):
+    def test_security_definer_owner_lacks_schema_usage(self):
+        rows = fcheck('cfg.fn_config_audit_trg()')
+        runs_as = by_check(rows, 'runs as')[0]
+        self.assertEqual(runs_as['object'], 'audit_owner')
+        self.assertIn('SECURITY DEFINER', runs_as['detail'])
+        self.assertIn('NOLOGIN (fine', by_check(rows, 'owner')[0]['detail'])
+        schema = by_check(rows, 'function schema')[0]
+        self.assertEqual(schema['result'], 'FAIL')
+        self.assertIn('NO USAGE on its own schema cfg', schema['detail'])
+        ref = [r for r in by_check(rows, 'reference') if r['object'] == 'cfg.config_audit'][0]
+        self.assertEqual((ref['line'], ref['action'], ref['result']), ('13', 'INSERT', 'NO'))
+        self.assertIn('USAGE on schema cfg', ref['detail'])
+        self.assertIn('INSERT itself is granted', ref['detail'])
+        self.assertTrue(ref['source'].startswith('INSERT INTO cfg.config_audit'))
+        seq = [r for r in by_check(rows, 'reference') if r['object'] == 'cfg.config_audit_id_seq'][0]
+        self.assertIn('defaults to nextval()', seq['detail'])
+        summary = by_check(rows, 'summary')[0]
+        self.assertEqual(summary['result'], 'FAIL')
+        self.assertEqual(summary['fix'], 'GRANT USAGE ON SCHEMA cfg TO audit_owner;')
+        # the server agrees with every YES/NO
+        for r in by_check(rows, 'reference'):
+            self.assertEqual(server_agrees('audit_owner', r['object'], r['action']) == 't',
+                             r['result'].startswith('YES'), r)
+        # with the fix applied (rolled back) the check passes and the real UPDATE works
+        out = q("BEGIN; GRANT USAGE ON SCHEMA cfg TO audit_owner; "
+                "SELECT result FROM access_function_check('cfg.fn_config_audit_trg()', 'cfg_user') "
+                "WHERE check_name = 'summary'; ROLLBACK;")
+        self.assertEqual(out, [['PASS']])
+        self.assertTrue(fix_works(summary['fix'], 'cfg_user', "UPDATE cfg.app_config SET value = '90'"))
+
+    def test_security_invoker_checks_the_caller(self):
+        rows = fcheck('cfg.fn_flag_audit_trg()')
+        self.assertEqual(by_check(rows, 'runs as')[0]['object'], 'cfg_user')
+        ref = by_check(rows, 'reference')[0]
+        self.assertEqual((ref['object'], ref['action'], ref['result'], ref['line']),
+                         ('cfg.flag_audit', 'INSERT', 'NO', '3'))
+        self.assertEqual(ref['fix'], 'GRANT INSERT ON TABLE cfg.flag_audit TO cfg_user;')
+        self.assertEqual(server_agrees('cfg_user', 'cfg.flag_audit', 'INSERT'), 'f')
+        # a different caller gives a different answer; the owner does not matter
+        self.assertEqual(by_check(fcheck('cfg.fn_flag_audit_trg()', 'postgres'), 'reference')[0]['result'], 'YES')
+
+    def test_owner_access_only_through_noinherit(self):
+        rows = fcheck('cfg.fn_log_change(text)')
+        self.assertEqual(by_check(rows, 'owner NOINHERIT')[0]['result'], 'WARN')
+        ref = by_check(rows, 'reference')[0]
+        self.assertEqual(ref['result'], 'NO (NOINHERIT)')
+        self.assertIn('SET ROLE is not allowed inside a SECURITY DEFINER function', ref['detail'])
+        self.assertNotIn('SET ROLE', ref['fix'])
+        self.assertIn('GRANT INSERT ON TABLE cfg.change_log TO noinh_owner;', ref['fix'])
+        # PostgreSQL agrees: SET ROLE is refused inside SECURITY DEFINER, and the call fails
+        self.assertIn('permission denied for schema cfg', login_error('cfg_user', "SELECT cfg.fn_log_change('x')"))
+        grants = '\n'.join(l for l in ref['fix'].splitlines() if not l.startswith('--'))
+        self.assertTrue(fix_works(grants, 'cfg_user', "SELECT cfg.fn_log_change('x')"))
+
+    def test_definer_without_pinned_search_path_and_nextval(self):
+        rows = fcheck('cfg.fn_next_change_id()')
+        sp = by_check(rows, 'search_path')[0]
+        self.assertEqual(sp['result'], 'WARN')
+        self.assertIn('without a pinned search_path', sp['detail'])
+        self.assertEqual(sp['fix'], 'ALTER FUNCTION cfg.fn_next_change_id() SET search_path = pg_catalog, cfg, pg_temp;')
+        refs = {(r['line'], r['object'], r['action']): r for r in by_check(rows, 'reference')}
+        self.assertEqual(refs[('5', 'cfg.change_seq', 'USAGE')]['result'], 'YES')
+        unq = refs[('6', 'cfg.app_config', 'SELECT')]
+        self.assertIn('assumed to be cfg.app_config', unq['detail'])
+        self.assertEqual(by_check(rows, 'summary')[0]['result'], 'WARN')
+
+    def test_unsafe_pinned_search_path(self):
+        out = q("""BEGIN;
+          CREATE FUNCTION public.tmp_sp() RETURNS int LANGUAGE sql SECURITY DEFINER SET search_path = cfg AS 'SELECT 1';
+          CREATE FUNCTION public.tmp_pub() RETURNS int LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS 'SELECT 1';
+          SELECT 'sp', result, detail FROM access_function_check('public.tmp_sp()') WHERE check_name = 'search_path'
+          UNION ALL
+          SELECT 'pub', result, detail FROM access_function_check('public.tmp_pub()') WHERE check_name = 'search_path';
+          ROLLBACK;""")
+        res = {r[0]: r[1:] for r in out}
+        self.assertEqual(res['sp'][0], 'WARN')
+        self.assertIn('pg_temp is not listed last', res['sp'][1])
+        if PGV == 14:  # PUBLIC may still CREATE in public
+            self.assertEqual(res['pub'][0], 'WARN')
+            self.assertIn('writable by PUBLIC', res['pub'][1])
+        else:
+            self.assertEqual(res['pub'][0], 'PASS')
+
+    def test_dynamic_sql_cannot_verify(self):
+        rows = fcheck('cfg.fn_purge(text)')
+        dyn = by_check(rows, 'dynamic SQL')[0]
+        self.assertEqual((dyn['result'], dyn['line']), ('CANNOT VERIFY', '3'))
+        self.assertIn('EXECUTE format', dyn['source'])
+        self.assertEqual(by_check(rows, 'summary')[0]['result'], 'CANNOT VERIFY')
+
+    def test_unqualified_names_resolved_through_pinned_search_path(self):
+        rows = fcheck('cfg.fn_count_flags()')
+        refs = {r['object']: r for r in by_check(rows, 'reference')}
+        self.assertIn('pinned search_path to schema cfg', refs['cfg.feature_flags']['detail'])
+        self.assertEqual(refs['cfg.fn_log_change(text)']['action'], 'EXECUTE')
+        self.assertEqual(by_check(rows, 'search_path')[0]['result'], 'PASS')
+
+    def test_search_path_lookup_skips_schema_without_usage(self):
+        create = ("CREATE FUNCTION public.tmp_skip() RETURNS void LANGUAGE plpgsql SECURITY DEFINER "
+                  "SET search_path = cfg, pg_temp AS 'BEGIN PERFORM 1 FROM change_log; END'; "
+                  "ALTER FUNCTION public.tmp_skip() OWNER TO audit_owner; ")
+        rows = q("BEGIN; " + create + "SELECT result, detail, suggested_fix FROM access_function_check('public.tmp_skip()') "
+                 "WHERE check_name = 'reference'; ROLLBACK;")
+        self.assertEqual(rows[0][0], 'NO')
+        self.assertIn('lookup skips it', rows[0][1])
+        self.assertEqual(rows[0][2], 'GRANT USAGE ON SCHEMA cfg TO audit_owner;')
+        # PostgreSQL agrees: the table is "not found", not "permission denied"
+        res = run("BEGIN; " + create + "SET LOCAL ROLE plain_user; SELECT public.tmp_skip(); ROLLBACK;", check=False)
+        self.assertIn('relation "change_log" does not exist', res.stderr)
+
+    def test_sql_language_function(self):
+        rows = fcheck('cfg.fn_sql_counts()')
+        self.assertIn('sql: body scanned', by_check(rows, 'language')[0]['detail'])
+        refs = {r['object']: (r['line'], r['result']) for r in by_check(rows, 'reference')}
+        self.assertEqual(refs, {'cfg.feature_flags': ('2', 'YES'), 'cfg.change_log': ('3', 'NO')})
+        self.assertEqual(by_check(rows, 'caller EXECUTE')[0]['result'], 'YES')
+
+    def test_other_language_is_not_scanned(self):
+        rows = fcheck('pg_catalog.now()')
+        self.assertIn('not scanned', by_check(rows, 'language')[0]['detail'])
+        self.assertEqual(by_check(rows, 'summary')[0]['result'], 'INFO')
+        self.assertFalse(by_check(rows, 'reference'))
+
+    def test_scanner_sees_statements_not_comments_or_strings(self):
+        body = ("\nBEGIN\n"
+                "  -- INSERT INTO fake.commented VALUES (1);\n"
+                "  RAISE NOTICE 'DELETE FROM fake.in_a_string';\n"
+                "  UPDATE cfg.app_config SET value = 'x' FROM cfg.feature_flags f WHERE f.name = key;\n"
+                "  DELETE FROM cfg.flag_audit WHERE name IS DISTINCT FROM 'y';\n"
+                "  TRUNCATE cfg.change_log;\n"
+                "  PERFORM cfg.fn_purge('t'), currval('cfg.change_seq');\n"
+                "  INSERT INTO cfg.nope VALUES (1);\n"
+                "END\n")
+        rows = q("BEGIN; CREATE FUNCTION public.tmp_scan() RETURNS void LANGUAGE plpgsql AS " + lit(body) + "; "
+                 "SELECT line, object, action, result FROM access_function_check('public.tmp_scan()', 'postgres') "
+                 "WHERE check_name = 'reference' ORDER BY step; ROLLBACK;")
+        self.assertEqual(rows, [
+            ['5', 'cfg.app_config', 'UPDATE', 'YES'],
+            ['5', 'cfg.feature_flags', 'SELECT', 'YES'],
+            ['6', 'cfg.flag_audit', 'DELETE', 'YES'],
+            ['7', 'cfg.change_log', 'TRUNCATE', 'YES'],
+            ['8', 'cfg.fn_purge(text)', 'EXECUTE', 'YES'],
+            ['8', 'cfg.change_seq', 'SELECT', 'YES'],
+            ['9', 'cfg.nope', 'INSERT', 'CANNOT VERIFY'],
+        ])
+
+    def test_regprocedure_argument_and_unknown_function(self):
+        rows = q("SELECT result FROM access_function_check('cfg.fn_log_change(text)'::regprocedure, 'cfg_user') "
+                 "WHERE check_name = 'summary'")
+        self.assertEqual(rows, [['FAIL']])
+        res = run("SELECT * FROM access_function_check('cfg.no_such_fn')", check=False)
+        self.assertIn('no function named cfg.no_such_fn', res.stderr)
+
+    def test_every_answer_matches_the_server(self):
+        funcs = ['cfg.fn_config_audit_trg()', 'cfg.fn_flag_audit_trg()', 'cfg.fn_log_change(text)',
+                 'cfg.fn_next_change_id()', 'cfg.fn_count_flags()', 'cfg.fn_sql_counts()']
+        checked = 0
+        for caller in ('cfg_user', 'app_user', 'postgres'):
+            for f in funcs:
+                rows = fcheck(f, caller)
+                eff = by_check(rows, 'runs as')[0]['object']
+                for r in by_check(rows, 'reference'):
+                    if r['result'] == 'CANNOT VERIFY':
+                        continue
+                    self.assertEqual(server_agrees(eff, r['object'], r['action']) == 't',
+                                     r['result'].startswith('YES'), (caller, f, r))
+                    checked += 1
+        self.assertGreater(checked, 25)
+
+
+class TriggerCheck(unittest.TestCase):
+    def rows(self, table, caller='cfg_user'):
+        keys = ('trigger', 'timing', 'events', 'enabled', 'function', 'check', 'line', 'object', 'action', 'result', 'detail', 'fix')
+        out = q(f"SELECT coalesce(trigger_name, ''), coalesce(timing, ''), coalesce(events, ''), coalesce(enabled, ''), "
+                f"coalesce(function_name, ''), check_name, coalesce(line::text, ''), coalesce(object, ''), "
+                f"coalesce(action, ''), result, coalesce(detail, ''), coalesce(suggested_fix, '') "
+                f"FROM access_trigger_check({lit(table)}, {lit(caller)}) ORDER BY step")
+        return [dict(zip(keys, r)) for r in out]
+
+    def test_definer_audit_trigger(self):
+        rows = self.rows('cfg.app_config')
+        caller = {r['action']: r['result'] for r in rows if r['check'] == 'caller privilege'}
+        self.assertEqual(caller, {'INSERT': 'YES', 'UPDATE': 'YES'})
+        trg = [r for r in rows if r['check'] == 'trigger'][0]
+        self.assertEqual((trg['trigger'], trg['timing'], trg['events'], trg['enabled'], trg['function']),
+                         ('trg_config_audit', 'AFTER ROW', 'INSERT OR UPDATE', 'enabled', 'cfg.fn_config_audit_trg()'))
+        self.assertIn('the function owner audit_owner (SECURITY DEFINER)', trg['detail'])
+        ref = [r for r in rows if r['check'] == 'reference' and r['object'] == 'cfg.config_audit'][0]
+        self.assertEqual((ref['line'], ref['result']), ('13', 'NO'))
+        summary = [r for r in rows if r['check'] == 'summary'][0]
+        self.assertTrue(fix_works(summary['fix'], 'cfg_user', "INSERT INTO cfg.app_config VALUES ('k', 'v')"))
+        self.assertFalse(works_as('cfg_user', "INSERT INTO cfg.app_config VALUES ('k', 'v')"))
+
+    def test_invoker_trigger_and_disabled_trigger(self):
+        rows = self.rows('cfg.feature_flags')
+        caller = {r['action'] for r in rows if r['check'] == 'caller privilege'}
+        self.assertEqual(caller, {'INSERT', 'UPDATE'})  # DELETE only has a disabled trigger
+        enabled = {r['trigger']: r['enabled'] for r in rows if r['check'] == 'trigger'}
+        self.assertEqual(enabled, {'trg_flag_audit': 'enabled', 'trg_flag_audit_old': 'disabled'})
+        ref = [r for r in rows if r['check'] == 'reference' and r['trigger'] == 'trg_flag_audit'][0]
+        self.assertIn('as cfg_user', ref['detail'])
+        self.assertEqual(ref['fix'], 'GRANT INSERT ON TABLE cfg.flag_audit TO cfg_user;')
+
+    def test_caller_without_table_privilege(self):
+        rows = self.rows('cfg.app_config', 'app_user')
+        caller = {r['action']: r['result'] for r in rows if r['check'] == 'caller privilege'}
+        self.assertEqual(caller, {'INSERT': 'NO', 'UPDATE': 'NO'})
+
+    def test_table_without_triggers(self):
+        rows = self.rows('sales.orders')
+        self.assertEqual(len(rows), 1)
+        self.assertIn('no user-defined triggers', rows[0]['detail'])
+
+
+class ExplainFunctionError(unittest.TestCase):
+    def find(self, rows, prefix):
+        return [r for r in rows if r[1].startswith(prefix)]
+
+    def fix(self, rows):
+        return self.find(rows, 'fix')[0][3]
+
+    def test_real_case_security_definer_owner_is_blamed(self):
+        stmt = "UPDATE cfg.app_config SET value = '60' WHERE key = 'timeout'"
+        err = login_error('cfg_user', stmt)
+        self.assertIn('permission denied for schema cfg', err)
+        self.assertIn('PL/pgSQL function cfg.fn_config_audit_trg() line 13 at SQL statement', err)
+        rows = explain(err, 'cfg_user')
+        self.assertIn('checked for role audit_owner', rows[0][2])
+        self.assertIn('line 13 of cfg.fn_config_audit_trg() (plpgsql, SECURITY DEFINER, owner audit_owner)',
+                      self.find(rows, 'raised in')[0][2])
+        self.assertIn('13:   INSERT INTO cfg.config_audit', self.find(rows, 'statement at line 13')[0][2])
+        self.assertTrue(self.find(rows, 'reference at line 13: INSERT cfg.config_audit: NO'))
+        self.assertTrue(self.find(rows, 'whose privilege: OWNER audit_owner'))
+        fix = self.fix(rows)
+        self.assertEqual(fix, 'GRANT USAGE ON SCHEMA cfg TO audit_owner;')
+        self.assertTrue(fix_works(fix, 'cfg_user', stmt))
+        # the caller is not the problem: it already has what the statement itself needs
+        self.assertEqual(q1("SELECT has_schema_privilege('cfg_user', 'cfg', 'USAGE') "
+                            "AND has_table_privilege('cfg_user', 'cfg.app_config', 'UPDATE')"), 't')
+
+    def test_client_where_format(self):
+        err = ('SQL Error [42501]: ERROR: permission denied for schema cfg\n'
+               '  Where: PL/pgSQL function cfg.fn_config_audit_trg() line 13 at SQL statement')
+        rows = explain(err, 'cfg_user')
+        self.assertTrue(self.find(rows, 'whose privilege: OWNER audit_owner'))
+        self.assertEqual(self.fix(rows), 'GRANT USAGE ON SCHEMA cfg TO audit_owner;')
+
+    def test_security_invoker_caller_is_blamed(self):
+        stmt = "INSERT INTO cfg.feature_flags VALUES ('beta', true)"
+        err = login_error('cfg_user', stmt)
+        self.assertIn('permission denied for table flag_audit', err)
+        rows = explain(err, 'cfg_user')
+        self.assertTrue(self.find(rows, 'whose privilege: CALLER cfg_user'))
+        self.assertEqual(self.find(rows, 'object')[0][2], 'cfg.flag_audit (table)')
+        self.assertIn('INSERT (taken from the function body, line 3)', self.find(rows, 'action')[0][2])
+        fix = self.fix(rows)
+        self.assertEqual(fix, 'GRANT INSERT ON TABLE cfg.flag_audit TO cfg_user;')
+        self.assertTrue(fix_works(fix, 'cfg_user', stmt))
+
+    def test_noinherit_owner_gets_direct_grants_not_set_role(self):
+        stmt = "SELECT cfg.fn_log_change('hello')"
+        rows = explain(login_error('cfg_user', stmt), 'cfg_user')
+        self.assertTrue(self.find(rows, 'whose privilege: OWNER noinh_owner'))
+        fix = self.fix(rows)
+        self.assertNotIn('SET ROLE', fix)
+        self.assertIn('GRANT USAGE ON SCHEMA cfg TO noinh_owner;', fix)
+        self.assertTrue(fix_works(fix, 'cfg_user', stmt))
+        # the SET ROLE that access_why suggests outside functions is refused in here
+        res = run("BEGIN; CREATE FUNCTION public.tmp_setrole() RETURNS void LANGUAGE plpgsql SECURITY DEFINER "
+                  "AS 'BEGIN SET ROLE cfg_writer; END'; SELECT public.tmp_setrole(); ROLLBACK;", check=False)
+        self.assertIn('cannot set parameter "role" within security-definer function', res.stderr)
+
+    def test_nested_call_uses_innermost_security_definer(self):
+        stmt = 'SELECT cfg.fn_count_flags()'
+        err = login_error('cfg_user', stmt)
+        rows = explain(err, 'cfg_user')
+        self.assertIn('called from', self.find(rows, 'raised in')[0][2])
+        self.assertTrue(self.find(rows, 'whose privilege: OWNER noinh_owner'))
+        self.assertTrue(fix_works(self.fix(rows), 'cfg_user', stmt))
+
+    def test_sql_function_statement_number(self):
+        stmt = 'SELECT cfg.fn_sql_counts()'
+        err = login_error('cfg_user', stmt)
+        self.assertIn('SQL function "fn_sql_counts" statement 2', err)
+        rows = explain(err, 'cfg_user')
+        self.assertIn('cfg.change_log', self.find(rows, 'statement at statement 2')[0][2])
+        self.assertTrue(self.find(rows, 'whose privilege: CALLER cfg_user'))
+        fix = self.fix(rows)
+        self.assertEqual(fix, 'GRANT SELECT ON TABLE cfg.change_log TO cfg_user;')
+        self.assertTrue(fix_works(fix, 'cfg_user', stmt))
+
+    def test_unknown_function_in_context(self):
+        rows = explain('ERROR: permission denied for schema cfg\nCONTEXT: PL/pgSQL function nowhere.fn() line 2 at SQL statement',
+                       'cfg_user')
+        self.assertIn('was not found', self.find(rows, 'raised in')[0][2])
+        self.assertTrue(self.find(rows, 'whose privilege: CALLER cfg_user (assumed)'))
+
 # --------------------------------------------------------------------------
 class Privileges(unittest.TestCase):
     def test_lists_inherited_privileges_with_source(self):
@@ -535,6 +870,8 @@ class Risky(unittest.TestCase):
         self.assertEqual(f[('unused login roles', '(skipped)')][0], 'INFO')
         self.assertNotIn(('deep chain', 'app_user'), f)
         self.assertFalse([k for k in f if k[1].startswith('public.access_')])
+        self.assertEqual(f[('PUBLIC grant', 'cfg.fn_log_change(text)')][0], 'HIGH')
+        self.assertNotIn(('PUBLIC grant', 'cfg.fn_config_audit_trg()'), f)  # trigger functions cannot be called
         if PGV == 14:
             self.assertEqual(f[('PUBLIC grant', 'public')][0], 'HIGH')  # PG14 default CREATE on public
         else:
@@ -591,6 +928,11 @@ ALL_CALLS = [
     "SELECT * FROM access_tree('app_read', 'down')",
     "SELECT access_tree_mermaid('app_user')",
     "SELECT * FROM access_risky()",
+    "SELECT * FROM access_function_check('cfg.fn_config_audit_trg()', 'cfg_user')",
+    "SELECT * FROM access_function_check('cfg.fn_count_flags()')",
+    "SELECT * FROM access_trigger_check('cfg.app_config', 'cfg_user')",
+    "SELECT * FROM access_explain_error('ERROR: permission denied for schema cfg CONTEXT: "
+    "PL/pgSQL function cfg.fn_config_audit_trg() line 13 at SQL statement', 'cfg_user')",
 ]
 
 
@@ -627,6 +969,28 @@ class ReadOnly(unittest.TestCase):
         self.assertIn('report_user → reporting | needs SET ROLE', out)
         self.assertIn('reporting [needs SET ROLE]', out)
         self.assertIn('NOINHERIT breaks the chain', out)
+        self.assertEqual(before, q1("SELECT (SELECT count(*) FROM pg_class) || '/' || (SELECT count(*) FROM pg_proc)"))
+
+    def test_psql_file_function_and_trigger_sections(self):
+        env = dict(os.environ, PGOPTIONS='-c default_transaction_read_only=on')
+        before = q1("SELECT (SELECT count(*) FROM pg_class) || '/' || (SELECT count(*) FROM pg_proc)")
+        res = subprocess.run(['psql', '-X', '-v', 'ON_ERROR_STOP=1', '-d', DB, '-v', 'role=cfg_user',
+                              '-v', 'function=cfg.fn_config_audit_trg', '-v', 'table=cfg.app_config',
+                              '-f', str(ROOT / 'psql' / 'access_checks.sql')],
+                             text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn('== 7.', out)
+        self.assertIn('== 8.', out)
+        self.assertRegex(out, r'SECURITY DEFINER \| audit_owner')
+        self.assertRegex(out, r'INSERT \| cfg.config_audit \| audit_owner \| false +\| true +\| GRANT USAGE ON SCHEMA cfg TO audit_owner;')
+        self.assertIn('audit_owner (owner, SECURITY DEFINER)', out)
+        res = subprocess.run(['psql', '-X', '-v', 'ON_ERROR_STOP=1', '-d', DB, '-v', 'role=cfg_user',
+                              '-v', 'function=cfg.fn_next_change_id()', '-f', str(ROOT / 'psql' / 'access_checks.sql')],
+                             text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('NOT PINNED (security risk)', res.stdout)
+        self.assertRegex(res.stdout, r'USAGE +\| cfg.change_seq +\| cfg_owner')
         self.assertEqual(before, q1("SELECT (SELECT count(*) FROM pg_class) || '/' || (SELECT count(*) FROM pg_proc)"))
 
     def test_psql_file_without_object(self):

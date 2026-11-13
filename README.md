@@ -10,6 +10,10 @@ even when a role inherits its privileges through many other roles.
 - **What does this error mean?** `access_explain_error` takes a
   `permission denied` message and returns the missing grant plus a `GRANT`
   statement to fix it. The fix is text only; nothing is ever run for you.
+- **Why does it fail inside a function or trigger?** `access_function_check`
+  and `access_trigger_check` tell you whose privileges count there (the owner
+  for `SECURITY DEFINER`, the caller otherwise) and check every object the
+  function body names, with the line number.
 - **Who is this role, really?** `access_chain` and `access_tree` show every
   role it belongs to, with the full path (`app_user → app_rw → app_read`) and
   whether each hop inherits, needs `SET ROLE`, or grants nothing.
@@ -22,7 +26,9 @@ writes data or changes grants.
 | Function | What it answers |
 |---|---|
 | `access_why(role, object, action [, object_type])` | Can the role do the action on the object? Which role supplied the grant, and which prerequisite blocks it? |
-| `access_explain_error(error_text [, role [, action]])` | What a `permission denied` / `must be owner` / RLS error means for this role, and the fix |
+| `access_explain_error(error_text [, role [, action]])` | What a `permission denied` / `must be owner` / RLS error means for this role, and the fix. Reads `CONTEXT:` / `Where:` lines to tell whether the function owner or the caller is missing the privilege |
+| `access_function_check(function [, caller_role])` | Who a function runs as, its owner, schema, pinned `search_path` and language, and whether that role can reach each table, sequence and function the body names (with line numbers) |
+| `access_trigger_check(table [, caller_role])` | Every trigger on a table (timing, events, enabled state), the caller's own privilege for those events, and `access_function_check` for each trigger function as the role it really runs as |
 | `access_chain(role)` | Every role it belongs to, directly or through others, with path, depth and INHERIT / SET / ADMIN per hop |
 | `access_tree(role [, 'up' \| 'down'])` | Indented membership tree. `up` = what it belongs to, `down` = who is under a group role |
 | `access_tree_mermaid(role [, 'up' \| 'down'])` | The same graph as Mermaid text for tickets and wikis |
@@ -121,6 +127,96 @@ looked up in every schema, so `orders` in two schemas returns both. Pass
 `object_type` (`table`, `view`, `sequence`, `function`, `schema`, `database`)
 to narrow it.
 
+## Functions and triggers
+
+A statement that fails *inside* a function or trigger is checked against a
+different role than you might expect:
+
+| The function is | Statements inside it run as | So the privileges that count are |
+|---|---|---|
+| `SECURITY INVOKER` (the default) | the caller (`current_user` of the session) | the caller's |
+| `SECURITY DEFINER` | the function **owner** | the owner's. The caller's grants do not matter |
+
+Triggers follow the same rule: a trigger function runs as the role that ran
+the `INSERT` / `UPDATE` / `DELETE`, unless the function is `SECURITY DEFINER`,
+in which case it runs as its owner. Three things catch people out:
+
+- **The owner needs USAGE too.** An owner with `INSERT` on `audit.log` but no
+  `USAGE` on schema `audit` still gets `permission denied for schema audit`,
+  even when the caller has full access.
+- **NOINHERIT memberships do not count.** `SET ROLE` is not allowed inside a
+  `SECURITY DEFINER` function, so an owner that reaches a grant only through a
+  NOINHERIT membership never gets it there. Grant it to the owner directly, or
+  make the membership inherit.
+- **Pin the `search_path`.** Without `SET search_path = ...` on the function,
+  unqualified names resolve through the *caller's* `search_path`, and
+  `pg_temp` is searched first. A caller can then shadow a table or function
+  and run code as the owner. Use `ALTER FUNCTION f SET search_path =
+  pg_catalog, <schema>, pg_temp;` and keep writable schemas off it.
+
+Example: an `UPDATE` fails with
+
+```text
+SQL Error [42501]: ERROR: permission denied for schema cfg
+  Where: PL/pgSQL function cfg.fn_config_audit_trg() line 13 at SQL statement
+```
+
+Paste the whole message, including the `Where:` or `CONTEXT:` line:
+
+```sql
+SELECT * FROM access_explain_error(
+  'ERROR: permission denied for schema cfg
+   Where: PL/pgSQL function cfg.fn_config_audit_trg() line 13 at SQL statement',
+  'cfg_user');
+```
+
+It finds the function, sees it is `SECURITY DEFINER`, checks the **owner**,
+shows line 13 of the body, and says `whose privilege: OWNER audit_owner` with
+`GRANT USAGE ON SCHEMA cfg TO audit_owner;` as the fix. Nested calls are
+followed: the innermost `SECURITY DEFINER` function in the `CONTEXT` lines
+decides whose privileges count. `SQL function "f" statement N` contexts (from
+`LANGUAGE sql` functions) work the same way.
+
+To check a function or a table's triggers before anything fails:
+
+```sql
+SELECT step, check_name, line, object, action, result, detail, suggested_fix
+  FROM access_function_check('cfg.fn_config_audit_trg()', 'cfg_user');
+
+SELECT trigger_name, check_name, line, object, action, result, detail
+  FROM access_trigger_check('cfg.app_config', 'cfg_user');
+```
+
+`access_function_check` accepts `schema.name`, `schema.name(argtypes)` or a
+`regprocedure`. The second argument is the role that calls the function (or
+runs the triggering statement); it defaults to `current_user`. Rows:
+
+| `check_name` | Meaning |
+|---|---|
+| `runs as` | `SECURITY DEFINER` (owner) or `SECURITY INVOKER` (caller): the role every other row is checked for |
+| `owner` | Owner and whether it can log in. A `NOLOGIN` owner is fine |
+| `function schema` | Owner of the function's schema, and whether the function owner has USAGE on it |
+| `search_path` | The pinned `search_path` (`proconfig`), with a security warning for `SECURITY DEFINER` functions that do not pin one, list a schema `PUBLIC` can write to, or do not put `pg_temp` last |
+| `language` | `plpgsql` and `sql` bodies are scanned; other languages are reported but not scanned |
+| `caller EXECUTE` | Can the caller call it (not checked for trigger functions, which need EXECUTE only when the trigger is created) |
+| `owner NOINHERIT` | `SECURITY DEFINER` owner with NOINHERIT memberships whose grants will not count |
+| `reference` | One object the body names: line, required action, `YES` / `NO` / `NO (NOINHERIT)` / `ONLY AFTER SET ROLE` / `COLUMNS ONLY` / `CANNOT VERIFY` for the effective role, and the fix |
+| `dynamic SQL` | An `EXECUTE` statement: `CANNOT VERIFY`, because the SQL is built at run time |
+| `summary` | Totals for the effective role and every fix in one place |
+
+How the body scan works: comments and string literals are skipped, then
+`INSERT INTO`, `UPDATE`, `DELETE FROM`, `TRUNCATE`, `MERGE INTO`, `FROM` /
+`JOIN` lists, `nextval` / `currval` / `setval('...')` and function or
+procedure calls (`PERFORM f()`, `SELECT f()`, `CALL p()`) are picked out with
+their line numbers. Line numbers match the ones in PL/pgSQL `CONTEXT` lines.
+Unqualified names are resolved through the function's pinned `search_path`,
+skipping schemas the effective role has no USAGE on, as PostgreSQL does. With
+no pinned path, a name that exists in exactly one schema is assumed to be that
+one (and says so); anything else is `CANNOT VERIFY`. An `INSERT` also checks
+the sequences behind `nextval()` column defaults, because those run with the
+inserting role's privileges. Database CONNECT is not checked inside functions:
+the session is already connected.
+
 ## No-install version
 
 For databases where you cannot create functions,
@@ -135,6 +231,15 @@ It prints the membership chain, the why-check (privilege with its sources,
 schema USAGE, CONNECT, column grants, RLS), the role's privileges, default
 privileges, who can access the object, and red flags. It is less detailed than
 the functions: no error parsing, comparison or suggested fixes.
+
+Add `-v function=schema.name` (with `-v role=<caller>`) for who a function runs
+as and a rough check of the schema-qualified tables and `nextval()` sequences
+in its body, and `-v table=schema.table` to list its triggers and who each one
+runs as:
+
+```sh
+psql -X -d mydb -v role=app_user -v function=cfg.fn_config_audit_trg -v table=cfg.app_config -f psql/access_checks.sql
+```
 
 ## Version notes
 
@@ -185,9 +290,19 @@ Predefined roles are understood: `pg_read_all_data` and `pg_write_all_data`
   `log_connections`, pgAudit or CloudWatch.
 - Privileges on types, languages, large objects, tablespaces, foreign servers
   and foreign-data wrappers are not analysed.
-- `SECURITY DEFINER` functions and views run with their owner's privileges.
-  `access_why` checks the object you name, not the objects a view or function
-  touches underneath.
+- `access_why` checks the object you name, not what a view touches
+  underneath. Views are not scanned (use `access_why` on the view's owner).
+- The function body scan is pattern based, not a full SQL parser. It does not
+  see objects reached through dynamic SQL (`EXECUTE`, reported as `CANNOT
+  VERIFY`), `DELETE ... USING` lists, `COPY`, `LOCK`, column-level needs
+  (`SELECT` for `UPDATE ... WHERE col`, `RETURNING`), objects used by
+  functions the body calls (check those functions separately), or plpgsql
+  variables that shadow table names. Temporary tables and CTE names are
+  `CANNOT VERIFY` or skipped. `MERGE` targets are reported as needing
+  INSERT, UPDATE and DELETE.
+- `access_explain_error` reads only the function names in `CONTEXT` / `Where:`
+  lines. It cannot see a `SET ROLE` the session ran before the call, and
+  anonymous `DO` blocks have no function to look up.
 - Membership paths are followed to 64 levels. Graphs with a very large number
   of overlapping paths make `access_chain` long, because it lists every path.
 - Default privilege gaps (`NOT COVERED`) are reported for schemas where the
@@ -199,11 +314,14 @@ Predefined roles are understood: `pg_read_all_data` and `pg_write_all_data`
 [`tests/fixture.sql`](tests/fixture.sql) (a 4-level chain, a NOINHERIT hop,
 PG16 SET-only and INHERIT-only memberships, column grants, RLS, default
 privileges per creator, PUBLIC grants, expired and locked roles, a forced
-membership cycle), installs the functions and runs
+membership cycle, and a `cfg` schema with SECURITY DEFINER and INVOKER
+trigger functions, a NOINHERIT function owner, dynamic SQL, an unpinned
+`search_path` and an SQL-language function), installs the functions and runs
 [`tests/test_inspector.py`](tests/test_inspector.py). Where possible the tests
 check a claim against what PostgreSQL really does: they log in as the role and
 run the statement, or apply the suggested fix inside a rolled-back transaction
-and confirm the statement then works.
+and confirm the statement then works. The function and trigger tests feed the
+real error text, `CONTEXT` lines included, into `access_explain_error`.
 
 ```sh
 PG_BINDIR=/usr/lib/postgresql/17/bin tests/run_tests.sh             # run the tests

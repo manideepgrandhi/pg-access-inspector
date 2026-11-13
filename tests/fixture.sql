@@ -131,3 +131,124 @@ GRANT SELECT ON ops.jobs TO ops_admin;
 GRANT SELECT ON ops.secrets TO vault;
 GRANT SELECT ON ops.dead TO dead_end;
 \endif
+
+-- functions and triggers ------------------------------------------------------
+-- A made-up copy of a real case: an UPDATE fails with
+--   permission denied for schema cfg
+--   CONTEXT: PL/pgSQL function cfg.fn_config_audit_trg() line 13 at SQL statement
+-- because the trigger function is SECURITY DEFINER and its OWNER (audit_owner)
+-- has INSERT on the audit table but no USAGE on schema cfg.
+CREATE ROLE cfg_owner NOLOGIN;
+CREATE ROLE cfg_app NOLOGIN;
+CREATE ROLE cfg_user LOGIN;      GRANT cfg_app TO cfg_user;
+CREATE ROLE audit_owner NOLOGIN;
+CREATE ROLE cfg_writer NOLOGIN;
+CREATE ROLE noinh_owner NOLOGIN NOINHERIT;  GRANT cfg_writer TO noinh_owner;
+GRANT CONNECT ON DATABASE inspector_test TO cfg_user;
+
+CREATE SCHEMA cfg AUTHORIZATION cfg_owner;
+GRANT USAGE ON SCHEMA cfg TO cfg_app, cfg_writer;
+SET ROLE cfg_owner;
+CREATE TABLE cfg.app_config (key text PRIMARY KEY, value text);
+CREATE TABLE cfg.config_audit (id bigserial, key text, old_value text, new_value text,
+                               changed_by text, changed_at timestamptz DEFAULT now());
+CREATE TABLE cfg.feature_flags (name text PRIMARY KEY, enabled boolean NOT NULL DEFAULT false);
+CREATE TABLE cfg.flag_audit (name text, enabled boolean, changed_by text);
+CREATE TABLE cfg.change_log (msg text);
+CREATE SEQUENCE cfg.change_seq;
+GRANT SELECT, INSERT, UPDATE ON cfg.app_config, cfg.feature_flags TO cfg_app;
+GRANT INSERT ON cfg.config_audit TO audit_owner;
+GRANT USAGE ON SEQUENCE cfg.config_audit_id_seq TO audit_owner;
+GRANT SELECT ON cfg.flag_audit TO cfg_app;
+GRANT INSERT ON cfg.change_log TO cfg_writer;
+INSERT INTO cfg.app_config VALUES ('timeout', '30');
+RESET ROLE;
+
+-- 1. SECURITY DEFINER audit trigger; the owner lacks USAGE on cfg (line 13)
+CREATE FUNCTION cfg.fn_config_audit_trg() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $body$
+DECLARE
+  v_old text;
+  v_new text;
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    v_old := OLD.value;
+  END IF;
+  v_new := NEW.value;
+  IF v_old IS NOT DISTINCT FROM v_new THEN
+    RETURN NEW;
+  END IF;
+  INSERT INTO cfg.config_audit (key, old_value, new_value, changed_by)
+  VALUES (NEW.key, v_old, v_new, session_user);
+  RETURN NEW;
+END
+$body$;
+ALTER FUNCTION cfg.fn_config_audit_trg() OWNER TO audit_owner;
+CREATE TRIGGER trg_config_audit AFTER INSERT OR UPDATE ON cfg.app_config
+  FOR EACH ROW EXECUTE FUNCTION cfg.fn_config_audit_trg();
+
+-- 2. SECURITY INVOKER audit trigger; the caller lacks INSERT on cfg.flag_audit
+CREATE FUNCTION cfg.fn_flag_audit_trg() RETURNS trigger
+LANGUAGE plpgsql AS $body$
+BEGIN
+  INSERT INTO cfg.flag_audit (name, enabled, changed_by)
+  VALUES (NEW.name, NEW.enabled, current_user);
+  RETURN NEW;
+END
+$body$;
+ALTER FUNCTION cfg.fn_flag_audit_trg() OWNER TO cfg_owner;
+CREATE TRIGGER trg_flag_audit BEFORE INSERT OR UPDATE ON cfg.feature_flags
+  FOR EACH ROW EXECUTE FUNCTION cfg.fn_flag_audit_trg();
+CREATE TRIGGER trg_flag_audit_old AFTER DELETE ON cfg.feature_flags
+  FOR EACH ROW EXECUTE FUNCTION cfg.fn_flag_audit_trg();
+ALTER TABLE cfg.feature_flags DISABLE TRIGGER trg_flag_audit_old;
+
+-- 3. SECURITY DEFINER; the owner gets cfg access only through a NOINHERIT membership
+CREATE FUNCTION cfg.fn_log_change(p_msg text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $body$
+BEGIN
+  INSERT INTO cfg.change_log (msg) VALUES (p_msg);
+END
+$body$;
+ALTER FUNCTION cfg.fn_log_change(text) OWNER TO noinh_owner;
+
+-- 4. SECURITY DEFINER without a pinned search_path; 7. a sequence via nextval
+CREATE FUNCTION cfg.fn_next_change_id() RETURNS bigint
+LANGUAGE plpgsql SECURITY DEFINER AS $body$
+DECLARE
+  v_id bigint;
+BEGIN
+  v_id := nextval('cfg.change_seq');
+  PERFORM 1 FROM app_config LIMIT 1;
+  RETURN v_id;
+END
+$body$;
+ALTER FUNCTION cfg.fn_next_change_id() OWNER TO cfg_owner;
+
+-- 5. dynamic SQL
+CREATE FUNCTION cfg.fn_purge(p_table text) RETURNS void
+LANGUAGE plpgsql AS $body$
+BEGIN
+  EXECUTE format('DELETE FROM cfg.%I', p_table);
+END
+$body$;
+
+-- 6. unqualified names resolved through the pinned search_path
+CREATE FUNCTION cfg.fn_count_flags() RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = cfg, pg_temp AS $body$
+DECLARE
+  v integer;
+BEGIN
+  SELECT count(*) INTO v FROM feature_flags;
+  PERFORM fn_log_change('counted flags');
+  RETURN v;
+END
+$body$;
+ALTER FUNCTION cfg.fn_count_flags() OWNER TO cfg_owner;
+
+-- 8. SQL-language function (errors say: SQL function "..." statement N)
+CREATE FUNCTION cfg.fn_sql_counts() RETURNS bigint
+LANGUAGE sql AS $body$
+  SELECT count(*) FROM cfg.feature_flags;
+  SELECT count(*) FROM cfg.change_log;
+$body$;
